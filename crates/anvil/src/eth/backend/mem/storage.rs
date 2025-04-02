@@ -41,7 +41,7 @@ use foundry_evm::{
 };
 use parking_lot::RwLock;
 use revm::primitives::SpecId;
-use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
+use std::{collections::VecDeque, fmt, path::PathBuf, sync::Arc, time::Duration};
 // use yansi::Paint;
 
 // === various limits in number of blocks ===
@@ -91,6 +91,12 @@ impl InMemoryBlockStates {
     /// Configures no disk caching
     pub fn memory_only(mut self) -> Self {
         self.max_on_disk_limit = 0;
+        self
+    }
+
+    /// Configures the path on disk where the states will cached.
+    pub fn disk_path(mut self, path: PathBuf) -> Self {
+        self.disk_cache = self.disk_cache.with_path(path);
         self
     }
 
@@ -265,7 +271,13 @@ pub struct BlockchainStorage {
 
 impl BlockchainStorage {
     /// Creates a new storage with a genesis block
-    pub fn new(env: &Env, spec_id: SpecId, base_fee: Option<u64>, timestamp: u64) -> Self {
+    pub fn new(
+        env: &Env,
+        spec_id: SpecId,
+        base_fee: Option<u64>,
+        timestamp: u64,
+        genesis_number: u64,
+    ) -> Self {
         let is_shanghai = spec_id >= SpecId::SHANGHAI;
         let is_cancun = spec_id >= SpecId::CANCUN;
         let is_prague = spec_id >= SpecId::PRAGUE;
@@ -288,7 +300,7 @@ impl BlockchainStorage {
         let block = Block::new::<MaybeImpersonatedTransaction>(partial_header, vec![]);
         let genesis_hash = block.header.hash_slow();
         let best_hash = genesis_hash;
-        let best_number: U64 = U64::from(0u64);
+        let best_number: U64 = U64::from(genesis_number);
 
         let mut blocks = B256HashMap::default();
         blocks.insert(genesis_hash, block);
@@ -338,7 +350,6 @@ impl BlockchainStorage {
         self.best_number = U64::from(block_number);
     }
 
-    #[allow(unused)]
     pub fn empty() -> Self {
         Self {
             blocks: Default::default(),
@@ -361,7 +372,7 @@ impl BlockchainStorage {
     /// Removes all stored transactions for the given block hash
     pub fn remove_block_transactions(&mut self, block_hash: B256) {
         if let Some(block) = self.blocks.get_mut(&block_hash) {
-            for tx in block.transactions.iter() {
+            for tx in &block.transactions {
                 self.transactions.remove(&tx.hash());
             }
             block.transactions.clear();
@@ -407,7 +418,7 @@ impl BlockchainStorage {
 
     /// Deserialize and add all blocks data to the backend storage
     pub fn load_blocks(&mut self, serializable_blocks: Vec<SerializableBlock>) {
-        for serializable_block in serializable_blocks.iter() {
+        for serializable_block in &serializable_blocks {
             let block: Block = serializable_block.clone().into();
             let block_hash = block.header.hash_slow();
             let block_number = block.header.number;
@@ -418,7 +429,7 @@ impl BlockchainStorage {
 
     /// Deserialize and add all blocks data to the backend storage
     pub fn load_transactions(&mut self, serializable_transactions: Vec<SerializableTransaction>) {
-        for serializable_transaction in serializable_transactions.iter() {
+        for serializable_transaction in &serializable_transactions {
             let transaction: MinedTransaction = serializable_transaction.clone().into();
             self.transactions.insert(transaction.info.transaction_hash, transaction);
         }
@@ -434,10 +445,20 @@ pub struct Blockchain {
 
 impl Blockchain {
     /// Creates a new storage with a genesis block
-    pub fn new(env: &Env, spec_id: SpecId, base_fee: Option<u64>, timestamp: u64) -> Self {
+    pub fn new(
+        env: &Env,
+        spec_id: SpecId,
+        base_fee: Option<u64>,
+        timestamp: u64,
+        genesis_number: u64,
+    ) -> Self {
         Self {
             storage: Arc::new(RwLock::new(BlockchainStorage::new(
-                env, spec_id, base_fee, timestamp,
+                env,
+                spec_id,
+                base_fee,
+                timestamp,
+                genesis_number,
             ))),
         }
     }
@@ -549,15 +570,9 @@ impl MinedTransaction {
                     }
                     GethDebugBuiltInTracerType::CallTracer => {
                         return match tracer_config.into_call_config() {
-                            Ok(call_config) => Ok(GethTraceBuilder::new(
-                                self.info.traces.clone(),
-                                TracingInspectorConfig::from_geth_config(&config),
-                            )
-                            .geth_call_traces(
-                                call_config,
-                                self.receipt.cumulative_gas_used() as u64,
-                            )
-                            .into()),
+                            Ok(call_config) => Ok(GethTraceBuilder::new(self.info.traces.clone())
+                                .geth_call_traces(call_config, self.receipt.cumulative_gas_used())
+                                .into()),
                             Err(e) => Err(RpcError::invalid_params(e.to_string()).into()),
                         };
                     }
@@ -573,16 +588,13 @@ impl MinedTransaction {
         }
 
         // default structlog tracer
-        Ok(GethTraceBuilder::new(
-            self.info.traces.clone(),
-            TracingInspectorConfig::from_geth_config(&config),
-        )
-        .geth_traces(
-            self.receipt.cumulative_gas_used() as u64,
-            self.info.out.clone().unwrap_or_default(),
-            opts.config,
-        )
-        .into())
+        Ok(GethTraceBuilder::new(self.info.traces.clone())
+            .geth_traces(
+                self.receipt.cumulative_gas_used(),
+                self.info.out.clone().unwrap_or_default(),
+                config,
+            )
+            .into())
     }
 }
 
@@ -596,7 +608,6 @@ pub struct MinedTransactionReceipt {
 }
 
 #[cfg(test)]
-#[allow(clippy::needless_return)]
 mod tests {
     use super::*;
     use crate::eth::backend::db::Db;
@@ -655,7 +666,7 @@ mod tests {
         storage.insert(two, StateDb::new(MemDb::default()));
 
         // wait for files to be flushed
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         assert_eq!(storage.on_disk_states.len(), 1);
         assert!(storage.on_disk_states.contains_key(&one));
@@ -683,7 +694,7 @@ mod tests {
         }
 
         // wait for files to be flushed
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         assert_eq!(storage.on_disk_states.len(), num_states - storage.min_in_memory_limit);
         assert_eq!(storage.present.len(), storage.min_in_memory_limit);

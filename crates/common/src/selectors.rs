@@ -2,11 +2,10 @@
 
 #![allow(missing_docs)]
 
-use crate::abi::abi_decode_calldata;
+use crate::{abi::abi_decode_calldata, provider::runtime_transport::RuntimeTransportBuilder};
 use alloy_json_abi::JsonAbi;
 use alloy_primitives::map::HashMap;
 use eyre::Context;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fmt,
@@ -16,6 +15,8 @@ use std::{
     },
     time::Duration,
 };
+
+const BASE_URL: &str = "https://api.openchain.xyz";
 const SELECTOR_LOOKUP_URL: &str = "https://api.openchain.xyz/signature-database/v1/lookup";
 const SELECTOR_IMPORT_URL: &str = "https://api.openchain.xyz/signature-database/v1/import";
 
@@ -38,20 +39,17 @@ pub struct OpenChainClient {
 }
 
 impl OpenChainClient {
-    /// Creates a new client with default settings
+    /// Creates a new client with default settings.
     pub fn new() -> eyre::Result<Self> {
-        let inner = reqwest::Client::builder()
-            .default_headers(HeaderMap::from_iter([(
-                HeaderName::from_static("user-agent"),
-                HeaderValue::from_static("forge"),
-            )]))
-            .timeout(REQ_TIMEOUT)
+        let inner = RuntimeTransportBuilder::new(BASE_URL.parse().unwrap())
+            .with_timeout(REQ_TIMEOUT)
             .build()
+            .reqwest_client()
             .wrap_err("failed to build OpenChain client")?;
         Ok(Self {
             inner,
-            spurious_connection: Arc::new(Default::default()),
-            timedout_requests: Arc::new(Default::default()),
+            spurious_connection: Default::default(),
+            timedout_requests: Default::default(),
             max_timedout_requests: MAX_TIMEDOUT_REQ,
         })
     }
@@ -140,7 +138,7 @@ impl OpenChainClient {
             .ok_or_else(|| eyre::eyre!("No signature found"))
     }
 
-    /// Decodes the given function or event selectors using OpenChain
+    /// Decodes the given function, error or event selectors using OpenChain.
     pub async fn decode_selectors(
         &self,
         selector_type: SelectorType,
@@ -164,8 +162,8 @@ impl OpenChainClient {
         self.ensure_not_spurious()?;
 
         let expected_len = match selector_type {
-            SelectorType::Function => 10, // 0x + hex(4bytes)
-            SelectorType::Event => 66,    // 0x + hex(32bytes)
+            SelectorType::Function | SelectorType::Error => 10, // 0x + hex(4bytes)
+            SelectorType::Event => 66,                          // 0x + hex(32bytes)
         };
         if let Some(s) = selectors.iter().find(|s| s.len() != expected_len) {
             eyre::bail!(
@@ -193,7 +191,7 @@ impl OpenChainClient {
         let url = format!(
             "{SELECTOR_LOOKUP_URL}?{ltype}={selectors_str}",
             ltype = match selector_type {
-                SelectorType::Function => "function",
+                SelectorType::Function | SelectorType::Error => "function",
                 SelectorType::Event => "event",
             },
             selectors_str = selectors.join(",")
@@ -212,7 +210,7 @@ impl OpenChainClient {
         }
 
         let decoded = match selector_type {
-            SelectorType::Function => api_response.result.function,
+            SelectorType::Function | SelectorType::Error => api_response.result.function,
             SelectorType::Event => api_response.result.event,
         };
 
@@ -391,6 +389,8 @@ pub enum SelectorType {
     Function,
     /// An event selector.
     Event,
+    /// An custom error selector.
+    Error,
 }
 
 /// Decodes the given function or event selector using OpenChain.
@@ -575,62 +575,11 @@ pub fn parse_signatures(tokens: Vec<String>) -> ParsedSignatures {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_macros)]
-#[allow(clippy::needless_return)]
 mod tests {
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_decode_selector() {
-        let sigs = decode_function_selector("0xa9059cbb").await;
-        assert_eq!(sigs.unwrap()[0], "transfer(address,uint256)".to_string());
-
-        let sigs = decode_function_selector("a9059cbb").await;
-        assert_eq!(sigs.unwrap()[0], "transfer(address,uint256)".to_string());
-
-        // invalid signature
-        decode_function_selector("0xa9059c")
-            .await
-            .map_err(|e| {
-                assert_eq!(
-                    e.to_string(),
-                    "Invalid selector 0xa9059c: expected 10 characters (including 0x prefix)."
-                )
-            })
-            .map(|_| panic!("Expected fourbyte error"))
-            .ok();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_decode_calldata() {
-        let decoded = decode_calldata("0xa9059cbb0000000000000000000000000a2ac0c368dc8ec680a0c98c907656bd970675950000000000000000000000000000000000000000000000000000000767954a79").await;
-        assert_eq!(decoded.unwrap()[0], "transfer(address,uint256)".to_string());
-
-        let decoded = decode_calldata("a9059cbb0000000000000000000000000a2ac0c368dc8ec680a0c98c907656bd970675950000000000000000000000000000000000000000000000000000000767954a79").await;
-        assert_eq!(decoded.unwrap()[0], "transfer(address,uint256)".to_string());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_import_selectors() {
-        let mut data = RawSelectorImportData::default();
-        data.function.push("transfer(address,uint256)".to_string());
-        let result = import_selectors(SelectorImportData::Raw(data)).await;
-        assert_eq!(
-            result.unwrap().result.function.duplicated.get("transfer(address,uint256)").unwrap(),
-            "0xa9059cbb"
-        );
-
-        let abi: JsonAbi = serde_json::from_str(r#"[{"constant":false,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function", "methodIdentifiers": {"transfer(address,uint256)(uint256)": "0xa9059cbb"}}]"#).unwrap();
-        let result = import_selectors(SelectorImportData::Abi(vec![abi])).await;
-        println!("{result:?}");
-        assert_eq!(
-            result.unwrap().result.function.duplicated.get("transfer(address,uint256)").unwrap(),
-            "0xa9059cbb"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_parse_signatures() {
+    #[test]
+    fn test_parse_signatures() {
         let result = parse_signatures(vec!["transfer(address,uint256)".to_string()]);
         assert_eq!(
             result,
@@ -683,60 +632,6 @@ mod tests {
         assert_eq!(
             result,
             ParsedSignatures { signatures: Default::default(), ..Default::default() }
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_decode_event_topic() {
-        let decoded = decode_event_topic(
-            "0x7e1db2a1cd12f0506ecd806dba508035b290666b84b096a87af2fd2a1516ede6",
-        )
-        .await;
-        assert_eq!(decoded.unwrap()[0], "updateAuthority(address,uint8)".to_string());
-
-        let decoded =
-            decode_event_topic("7e1db2a1cd12f0506ecd806dba508035b290666b84b096a87af2fd2a1516ede6")
-                .await;
-        assert_eq!(decoded.unwrap()[0], "updateAuthority(address,uint8)".to_string());
-
-        let decoded = decode_event_topic(
-            "0xb7009613e63fb13fd59a2fa4c206a992c1f090a44e5d530be255aa17fed0b3dd",
-        )
-        .await;
-        assert_eq!(decoded.unwrap()[0], "canCall(address,address,bytes4)".to_string());
-
-        let decoded =
-            decode_event_topic("b7009613e63fb13fd59a2fa4c206a992c1f090a44e5d530be255aa17fed0b3dd")
-                .await;
-        assert_eq!(decoded.unwrap()[0], "canCall(address,address,bytes4)".to_string());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_decode_selectors() {
-        let event_topics = vec![
-            "7e1db2a1cd12f0506ecd806dba508035b290666b84b096a87af2fd2a1516ede6",
-            "0xb7009613e63fb13fd59a2fa4c206a992c1f090a44e5d530be255aa17fed0b3dd",
-        ];
-        let decoded = decode_selectors(SelectorType::Event, event_topics).await;
-        let decoded = decoded.unwrap();
-        assert_eq!(
-            decoded,
-            vec![
-                Some(vec!["updateAuthority(address,uint8)".to_string()]),
-                Some(vec!["canCall(address,address,bytes4)".to_string()]),
-            ]
-        );
-
-        let function_selectors = vec!["0xa9059cbb", "0x70a08231", "313ce567"];
-        let decoded = decode_selectors(SelectorType::Function, function_selectors).await;
-        let decoded = decoded.unwrap();
-        assert_eq!(
-            decoded,
-            vec![
-                Some(vec!["transfer(address,uint256)".to_string()]),
-                Some(vec!["balanceOf(address)".to_string()]),
-                Some(vec!["decimals()".to_string()]),
-            ]
         );
     }
 }

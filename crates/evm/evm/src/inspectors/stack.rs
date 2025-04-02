@@ -17,7 +17,7 @@ use revm::{
         Account, AccountStatus, BlockEnv, CreateScheme, Env, EnvWithHandlerCfg, ExecutionResult,
         HashMap, Output, TransactTo,
     },
-    EvmContext, Inspector,
+    EvmContext, Inspector, JournaledState,
 };
 use std::{
     ops::{Deref, DerefMut},
@@ -55,10 +55,12 @@ pub struct InspectorStackBuilder {
     /// In isolation mode all top-level calls are executed as a separate transaction in a separate
     /// EVM context, enabling more precise gas accounting and transaction state changes.
     pub enable_isolation: bool,
-    /// Whether to enable Alphanet features.
-    pub alphanet: bool,
+    /// Whether to enable Odyssey features.
+    pub odyssey: bool,
     /// The wallets to set in the cheatcodes context.
     pub wallets: Option<Wallets>,
+    /// The CREATE2 deployer address.
+    pub create2_deployer: Address,
 }
 
 impl InspectorStackBuilder {
@@ -148,11 +150,17 @@ impl InspectorStackBuilder {
         self
     }
 
-    /// Set whether to enable Alphanet features.
+    /// Set whether to enable Odyssey features.
     /// For description of call isolation, see [`InspectorStack::enable_isolation`].
     #[inline]
-    pub fn alphanet(mut self, yes: bool) -> Self {
-        self.alphanet = yes;
+    pub fn odyssey(mut self, yes: bool) -> Self {
+        self.odyssey = yes;
+        self
+    }
+
+    #[inline]
+    pub fn create2_deployer(mut self, create2_deployer: Address) -> Self {
+        self.create2_deployer = create2_deployer;
         self
     }
 
@@ -169,8 +177,9 @@ impl InspectorStackBuilder {
             print,
             chisel_state,
             enable_isolation,
-            alphanet,
+            odyssey,
             wallets,
+            create2_deployer,
         } = self;
         let mut stack = InspectorStack::new();
 
@@ -196,7 +205,8 @@ impl InspectorStackBuilder {
         stack.tracing(trace_mode);
 
         stack.enable_isolation(enable_isolation);
-        stack.alphanet(alphanet);
+        stack.odyssey(odyssey);
+        stack.set_create2_deployer(create2_deployer);
 
         // environment, must come after all of the inspectors
         if let Some(block) = block {
@@ -281,7 +291,8 @@ pub struct InspectorStackInner {
     pub printer: Option<CustomPrintTracer>,
     pub tracer: Option<TracingInspector>,
     pub enable_isolation: bool,
-    pub alphanet: bool,
+    pub odyssey: bool,
+    pub create2_deployer: Address,
 
     /// Flag marking if we are in the inner EVM context.
     pub in_inner_context: bool,
@@ -394,8 +405,14 @@ impl InspectorStack {
 
     /// Set whether to enable call isolation.
     #[inline]
-    pub fn alphanet(&mut self, yes: bool) {
-        self.alphanet = yes;
+    pub fn odyssey(&mut self, yes: bool) {
+        self.odyssey = yes;
+    }
+
+    /// Set the CREATE2 deployer address.
+    #[inline]
+    pub fn set_create2_deployer(&mut self, deployer: Address) {
+        self.create2_deployer = deployer;
     }
 
     /// Set whether to enable the log collector.
@@ -453,7 +470,7 @@ impl InspectorStack {
                 .map(|cheatcodes| cheatcodes.labels.clone())
                 .unwrap_or_default(),
             traces,
-            coverage: coverage.map(|coverage| coverage.maps),
+            coverage: coverage.map(|coverage| coverage.finish()),
             cheatcodes,
             chisel_state: chisel_state.and_then(|state| state.state),
         }
@@ -681,7 +698,10 @@ impl InspectorStackRefMut<'_> {
     /// it.
     fn with_stack<O>(&mut self, f: impl FnOnce(&mut InspectorStack) -> O) -> O {
         let mut stack = InspectorStack {
-            cheatcodes: self.cheatcodes.as_deref_mut().map(std::mem::take),
+            cheatcodes: self
+                .cheatcodes
+                .as_deref_mut()
+                .map(|cheats| core::mem::replace(cheats, Cheatcodes::new(cheats.config.clone()))),
             inner: std::mem::take(self.inner),
         };
 
@@ -826,20 +846,47 @@ impl Inspector<&mut dyn DatabaseExt> for InspectorStackRefMut<'_> {
             }
         }
 
-        if self.enable_isolation &&
-            call.scheme == CallScheme::Call &&
-            !self.in_inner_context &&
-            ecx.journaled_state.depth == 1
-        {
-            let (result, _) = self.transact_inner(
-                ecx,
-                TxKind::Call(call.target_address),
-                call.caller,
-                call.input.clone(),
-                call.gas_limit,
-                call.value.get(),
-            );
-            return Some(CallOutcome { result, memory_offset: call.return_memory_offset.clone() });
+        if self.enable_isolation && !self.in_inner_context && ecx.journaled_state.depth == 1 {
+            match call.scheme {
+                // Isolate CALLs
+                CallScheme::Call | CallScheme::ExtCall => {
+                    let (result, _) = self.transact_inner(
+                        ecx,
+                        TxKind::Call(call.target_address),
+                        call.caller,
+                        call.input.clone(),
+                        call.gas_limit,
+                        call.value.get(),
+                    );
+                    return Some(CallOutcome {
+                        result,
+                        memory_offset: call.return_memory_offset.clone(),
+                    });
+                }
+                // Mark accounts and storage cold before STATICCALLs
+                CallScheme::StaticCall | CallScheme::ExtStaticCall => {
+                    let JournaledState { state, warm_preloaded_addresses, .. } =
+                        &mut ecx.journaled_state;
+                    for (addr, acc_mut) in state {
+                        // Do not mark accounts and storage cold accounts with arbitrary storage.
+                        if let Some(cheatcodes) = &self.cheatcodes {
+                            if cheatcodes.has_arbitrary_storage(addr) {
+                                continue;
+                            }
+                        }
+
+                        if !warm_preloaded_addresses.contains(addr) {
+                            acc_mut.mark_cold();
+                        }
+
+                        for slot_mut in acc_mut.storage.values_mut() {
+                            slot_mut.is_cold = true;
+                        }
+                    }
+                }
+                // Process other variants as usual
+                CallScheme::CallCode | CallScheme::DelegateCall | CallScheme::ExtDelegateCall => {}
+            }
         }
 
         None
@@ -1013,14 +1060,18 @@ impl InspectorExt for InspectorStackRefMut<'_> {
         false
     }
 
-    fn console_log(&mut self, input: String) {
+    fn console_log(&mut self, msg: &str) {
         call_inspectors!([&mut self.log_collector], |inspector| InspectorExt::console_log(
-            inspector, input
+            inspector, msg
         ));
     }
 
-    fn is_alphanet(&self) -> bool {
-        self.inner.alphanet
+    fn is_odyssey(&self) -> bool {
+        self.inner.odyssey
+    }
+
+    fn create2_deployer(&self) -> Address {
+        self.inner.create2_deployer
     }
 }
 
@@ -1121,8 +1172,12 @@ impl InspectorExt for InspectorStack {
         self.as_mut().should_use_create2_factory(ecx, inputs)
     }
 
-    fn is_alphanet(&self) -> bool {
-        self.alphanet
+    fn is_odyssey(&self) -> bool {
+        self.odyssey
+    }
+
+    fn create2_deployer(&self) -> Address {
+        self.create2_deployer
     }
 }
 

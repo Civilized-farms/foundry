@@ -8,9 +8,9 @@ use crate::{
     InspectorExt,
 };
 use alloy_genesis::GenesisAccount;
+use alloy_network::{AnyRpcBlock, AnyTxEnvelope, TransactionResponse};
 use alloy_primitives::{keccak256, uint, Address, TxKind, B256, U256};
-use alloy_rpc_types::{Block, BlockNumberOrTag, Transaction, TransactionRequest};
-use alloy_serde::WithOtherFields;
+use alloy_rpc_types::{BlockNumberOrTag, Transaction, TransactionRequest};
 use eyre::Context;
 use foundry_common::{is_known_system_sender, SYSTEM_TRANSACTION_TYPE};
 pub use foundry_fork_db::{cache::BlockchainDbMeta, BlockchainDb, SharedBackend};
@@ -770,7 +770,7 @@ impl Backend {
         self.initialize(env);
         let mut evm = crate::utils::new_evm_with_inspector(self, env.clone(), inspector);
 
-        let res = evm.transact().wrap_err("backend: failed while inspecting")?;
+        let res = evm.transact().wrap_err("EVM error")?;
 
         env.env = evm.context.evm.inner.env;
 
@@ -839,7 +839,7 @@ impl Backend {
         &self,
         id: LocalForkId,
         transaction: B256,
-    ) -> eyre::Result<(u64, Block<WithOtherFields<Transaction>>)> {
+    ) -> eyre::Result<(u64, AnyRpcBlock)> {
         let fork = self.inner.get_fork_by_id(id)?;
         let tx = fork.db.db.get_transaction(transaction)?;
 
@@ -850,13 +850,11 @@ impl Backend {
             // we need to subtract 1 here because we want the state before the transaction
             // was mined
             let fork_block = tx_block - 1;
-            Ok((fork_block, block.inner))
+            Ok((fork_block, block))
         } else {
             let block = fork.db.db.get_full_block(BlockNumberOrTag::Latest)?;
 
             let number = block.header.number;
-
-            let block = block.inner;
 
             Ok((number, block))
         }
@@ -871,7 +869,7 @@ impl Backend {
         env: Env,
         tx_hash: B256,
         journaled_state: &mut JournaledState,
-    ) -> eyre::Result<Option<Transaction>> {
+    ) -> eyre::Result<Option<Transaction<AnyTxEnvelope>>> {
         trace!(?id, ?tx_hash, "replay until transaction");
 
         let persistent_accounts = self.inner.persistent_accounts.clone();
@@ -881,21 +879,21 @@ impl Backend {
         let fork = self.inner.get_fork_by_id_mut(id)?;
         let full_block = fork.db.db.get_full_block(env.block.number.to::<u64>())?;
 
-        for tx in full_block.inner.transactions.into_transactions() {
+        for tx in full_block.inner.transactions.txns() {
             // System transactions such as on L2s don't contain any pricing info so we skip them
             // otherwise this would cause reverts
-            if is_known_system_sender(tx.from) ||
-                tx.transaction_type == Some(SYSTEM_TRANSACTION_TYPE)
+            if is_known_system_sender(tx.from()) ||
+                tx.transaction_type() == Some(SYSTEM_TRANSACTION_TYPE)
             {
-                trace!(tx=?tx.hash, "skipping system transaction");
+                trace!(tx=?tx.tx_hash(), "skipping system transaction");
                 continue;
             }
 
-            if tx.hash == tx_hash {
+            if tx.tx_hash() == tx_hash {
                 // found the target transaction
-                return Ok(Some(tx.inner))
+                return Ok(Some(tx.inner.clone()))
             }
-            trace!(tx=?tx.hash, "committing transaction");
+            trace!(tx=?tx.tx_hash(), "committing transaction");
 
             commit_transaction(
                 &tx.inner,
@@ -1184,7 +1182,7 @@ impl DatabaseExt for Backend {
                 // Special case for accounts that are not created: we don't merge their state but
                 // load it in order to reflect their state at the new block (they should explicitly
                 // be marked as persistent if it is desired to keep state between fork rolls).
-                for (addr, acc) in journaled_state.state.iter() {
+                for (addr, acc) in &journaled_state.state {
                     if acc.is_created() {
                         if acc.is_touched() {
                             merge_journaled_state_data(
@@ -1283,7 +1281,7 @@ impl DatabaseExt for Backend {
         self.commit(journaled_state.state.clone());
 
         let res = {
-            configure_tx_req_env(&mut env, tx)?;
+            configure_tx_req_env(&mut env, tx, None)?;
             let env = self.env_with_handler_cfg(env);
 
             let mut db = self.clone();
@@ -1377,7 +1375,7 @@ impl DatabaseExt for Backend {
         journaled_state: &mut JournaledState,
     ) -> Result<(), BackendError> {
         // Loop through all of the allocs defined in the map and commit them to the journal.
-        for (addr, acc) in allocs.iter() {
+        for (addr, acc) in allocs {
             self.clone_account(acc, addr, journaled_state)?;
         }
 
@@ -1914,22 +1912,24 @@ fn is_contract_in_state(journaled_state: &JournaledState, acc: Address) -> bool 
 }
 
 /// Updates the env's block with the block's data
-fn update_env_block<T>(env: &mut Env, block: &Block<T>) {
+fn update_env_block(env: &mut Env, block: &AnyRpcBlock) {
     env.block.timestamp = U256::from(block.header.timestamp);
-    env.block.coinbase = block.header.miner;
+    env.block.coinbase = block.header.beneficiary;
     env.block.difficulty = block.header.difficulty;
     env.block.prevrandao = Some(block.header.mix_hash.unwrap_or_default());
     env.block.basefee = U256::from(block.header.base_fee_per_gas.unwrap_or_default());
     env.block.gas_limit = U256::from(block.header.gas_limit);
     env.block.number = U256::from(block.header.number);
-    env.block.blob_excess_gas_and_price =
-        block.header.excess_blob_gas.map(BlobExcessGasAndPrice::new);
+    if let Some(excess_blob_gas) = block.header.excess_blob_gas {
+        env.block.blob_excess_gas_and_price =
+            Some(BlobExcessGasAndPrice::new(excess_blob_gas, false));
+    }
 }
 
 /// Executes the given transaction and commits state changes to the database _and_ the journaled
 /// state, with an inspector.
 fn commit_transaction(
-    tx: &Transaction,
+    tx: &Transaction<AnyTxEnvelope>,
     mut env: EnvWithHandlerCfg,
     journaled_state: &mut JournaledState,
     fork: &mut Fork,
@@ -1937,12 +1937,6 @@ fn commit_transaction(
     persistent_accounts: &HashSet<Address>,
     inspector: &mut dyn InspectorExt,
 ) -> eyre::Result<()> {
-    // TODO: Remove after https://github.com/foundry-rs/foundry/pull/9131
-    // if the tx has the blob_versioned_hashes field, we assume it's a Cancun block
-    if tx.blob_versioned_hashes.is_some() {
-        env.handler_cfg.spec_id = SpecId::CANCUN;
-    }
-
     configure_tx_env(&mut env.env, tx);
 
     let now = Instant::now();
@@ -1971,9 +1965,9 @@ pub fn update_state<DB: Database>(
     persistent_accounts: Option<&HashSet<Address>>,
 ) -> Result<(), DB::Error> {
     for (addr, acc) in state.iter_mut() {
-        if !persistent_accounts.map_or(false, |accounts| accounts.contains(addr)) {
+        if !persistent_accounts.is_some_and(|accounts| accounts.contains(addr)) {
             acc.info = db.basic(*addr)?.unwrap_or_default();
-            for (key, val) in acc.storage.iter_mut() {
+            for (key, val) in &mut acc.storage {
                 val.present_value = db.storage(*addr, *key)?;
             }
         }
@@ -2000,7 +1994,6 @@ fn apply_state_changeset(
 }
 
 #[cfg(test)]
-#[allow(clippy::needless_return)]
 mod tests {
     use crate::{backend::Backend, fork::CreateFork, opts::EvmOpts};
     use alloy_primitives::{Address, U256};

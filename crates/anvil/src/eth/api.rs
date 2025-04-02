@@ -30,15 +30,19 @@ use crate::{
     revm::primitives::{BlobExcessGasAndPrice, Output},
     ClientFork, LoggingManager, Miner, MiningMode, StorageInfo,
 };
-use alloy_consensus::{transaction::eip4844::TxEip4844Variant, Account, TxEnvelope};
+use alloy_consensus::{
+    transaction::{eip4844::TxEip4844Variant, Recovered},
+    Account,
+};
 use alloy_dyn_abi::TypedData;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::{
-    eip2718::Decodable2718, BlockResponse, Ethereum, NetworkWallet, TransactionBuilder,
+    eip2718::Decodable2718, AnyRpcBlock, AnyRpcTransaction, BlockResponse, Ethereum, NetworkWallet,
+    TransactionBuilder, TransactionResponse,
 };
 use alloy_primitives::{
     map::{HashMap, HashSet},
-    Address, Bytes, Parity, TxHash, TxKind, B256, B64, U256, U64,
+    Address, Bytes, PrimitiveSignature as Signature, TxHash, TxKind, B256, B64, U256, U64,
 };
 use alloy_provider::utils::{
     eip1559_default_estimator, EIP1559_FEE_ESTIMATION_PAST_BLOCKS,
@@ -49,6 +53,7 @@ use alloy_rpc_types::{
         ForkedNetwork, Forking, Metadata, MineOptions, NodeEnvironment, NodeForkConfig, NodeInfo,
     },
     request::TransactionRequest,
+    simulate::{SimulatePayload, SimulatedBlock},
     state::StateOverride,
     trace::{
         filter::TraceFilter,
@@ -56,12 +61,10 @@ use alloy_rpc_types::{
         parity::LocalizedTransactionTrace,
     },
     txpool::{TxpoolContent, TxpoolInspect, TxpoolInspectSummary, TxpoolStatus},
-    AccessList, AccessListResult, AnyNetworkBlock, BlockId, BlockNumberOrTag as BlockNumber,
-    BlockTransactions, EIP1186AccountProofResponse, FeeHistory, Filter, FilteredParams, Index, Log,
-    Transaction,
+    AccessList, AccessListResult, BlockId, BlockNumberOrTag as BlockNumber, BlockTransactions,
+    EIP1186AccountProofResponse, FeeHistory, Filter, FilteredParams, Index, Log,
 };
 use alloy_serde::WithOtherFields;
-use alloy_signer::Signature;
 use alloy_transport::TransportErrorKind;
 use anvil_core::{
     eth::{
@@ -131,7 +134,7 @@ pub struct EthApi {
 
 impl EthApi {
     /// Creates a new instance
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         pool: Arc<Pool>,
         backend: Arc<backend::mem::Backend>,
@@ -162,7 +165,7 @@ impl EthApi {
     /// Executes the [EthRequest] and returns an RPC [ResponseResult].
     pub async fn execute(&self, request: EthRequest) -> ResponseResult {
         trace!(target: "rpc::api", "executing eth request");
-        match request {
+        let response = match request.clone() {
             EthRequest::Web3ClientVersion(()) => self.client_version().to_rpc_result(),
             EthRequest::Web3Sha3(content) => self.sha3(content).to_rpc_result(),
             EthRequest::EthGetAccount(addr, block) => {
@@ -246,6 +249,9 @@ impl EthApi {
             }
             EthRequest::EthCall(call, block, overrides) => {
                 self.call(call, block, overrides).await.to_rpc_result()
+            }
+            EthRequest::EthSimulateV1(simulation, block) => {
+                self.simulate_v1(simulation, block).await.to_rpc_result()
             }
             EthRequest::EthCreateAccessList(call, block) => {
                 self.create_access_list(call, block).await.to_rpc_result()
@@ -457,6 +463,7 @@ impl EthApi {
             EthRequest::Reorg(reorg_options) => {
                 self.anvil_reorg(reorg_options).await.to_rpc_result()
             }
+            EthRequest::Rollback(depth) => self.anvil_rollback(depth).await.to_rpc_result(),
             EthRequest::WalletGetCapabilities(()) => self.get_capabilities().to_rpc_result(),
             EthRequest::WalletSendTransaction(tx) => {
                 self.wallet_send_transaction(*tx).await.to_rpc_result()
@@ -465,7 +472,15 @@ impl EthApi {
             EthRequest::AnvilSetExecutor(executor_pk) => {
                 self.anvil_set_executor(executor_pk).to_rpc_result()
             }
+        };
+
+        if let ResponseResult::Error(err) = &response {
+            node_info!("\nRPC request failed:");
+            node_info!("    Request: {:?}", request);
+            node_info!("    Error: {}\n", err);
         }
+
+        response
     }
 
     fn sign_request(
@@ -475,13 +490,11 @@ impl EthApi {
     ) -> Result<TypedTransaction> {
         match request {
             TypedTransactionRequest::Deposit(_) => {
-                let nil_signature: alloy_primitives::Signature =
-                    alloy_primitives::Signature::from_scalars_and_parity(
-                        B256::with_last_byte(1),
-                        B256::with_last_byte(1),
-                        Parity::Parity(false),
-                    )
-                    .unwrap();
+                let nil_signature = Signature::from_scalars_and_parity(
+                    B256::with_last_byte(1),
+                    B256::with_last_byte(1),
+                    false,
+                );
                 return build_typed_transaction(request, nil_signature)
             }
             _ => {
@@ -514,10 +527,7 @@ impl EthApi {
         match self.pool.get_transaction(hash) {
             Some(tx) => Ok(Some(tx.transaction.encoded_2718().into())),
             None => match self.backend.transaction_by_hash(hash).await? {
-                Some(tx) => TxEnvelope::try_from(tx.inner)
-                    .map_or(Err(BlockchainError::FailedToDecodeTransaction), |tx| {
-                        Ok(Some(tx.encoded_2718().into()))
-                    }),
+                Some(tx) => Ok(Some(tx.inner.inner.encoded_2718().into())),
                 None => Ok(None),
             },
         }
@@ -742,7 +752,7 @@ impl EthApi {
     /// Returns block with given hash.
     ///
     /// Handler for ETH RPC call: `eth_getBlockByHash`
-    pub async fn block_by_hash(&self, hash: B256) -> Result<Option<AnyNetworkBlock>> {
+    pub async fn block_by_hash(&self, hash: B256) -> Result<Option<AnyRpcBlock>> {
         node_info!("eth_getBlockByHash");
         self.backend.block_by_hash(hash).await
     }
@@ -750,7 +760,7 @@ impl EthApi {
     /// Returns a _full_ block with given hash.
     ///
     /// Handler for ETH RPC call: `eth_getBlockByHash`
-    pub async fn block_by_hash_full(&self, hash: B256) -> Result<Option<AnyNetworkBlock>> {
+    pub async fn block_by_hash_full(&self, hash: B256) -> Result<Option<AnyRpcBlock>> {
         node_info!("eth_getBlockByHash");
         self.backend.block_by_hash_full(hash).await
     }
@@ -758,7 +768,7 @@ impl EthApi {
     /// Returns block with given number.
     ///
     /// Handler for ETH RPC call: `eth_getBlockByNumber`
-    pub async fn block_by_number(&self, number: BlockNumber) -> Result<Option<AnyNetworkBlock>> {
+    pub async fn block_by_number(&self, number: BlockNumber) -> Result<Option<AnyRpcBlock>> {
         node_info!("eth_getBlockByNumber");
         if number == BlockNumber::Pending {
             return Ok(Some(self.pending_block().await));
@@ -770,10 +780,7 @@ impl EthApi {
     /// Returns a _full_ block with given number
     ///
     /// Handler for ETH RPC call: `eth_getBlockByNumber`
-    pub async fn block_by_number_full(
-        &self,
-        number: BlockNumber,
-    ) -> Result<Option<AnyNetworkBlock>> {
+    pub async fn block_by_number_full(&self, number: BlockNumber) -> Result<Option<AnyRpcBlock>> {
         node_info!("eth_getBlockByNumber");
         if number == BlockNumber::Pending {
             return Ok(self.pending_block_full().await);
@@ -1100,6 +1107,33 @@ impl EthApi {
         .await
     }
 
+    pub async fn simulate_v1(
+        &self,
+        request: SimulatePayload,
+        block_number: Option<BlockId>,
+    ) -> Result<Vec<SimulatedBlock<AnyRpcBlock>>> {
+        node_info!("eth_simulateV1");
+        let block_request = self.block_request(block_number).await?;
+        // check if the number predates the fork, if in fork mode
+        if let BlockRequest::Number(number) = block_request {
+            if let Some(fork) = self.get_fork() {
+                if fork.predates_fork(number) {
+                    return Ok(fork.simulate_v1(&request, Some(number.into())).await?)
+                }
+            }
+        }
+
+        // this can be blocking for a bit, especially in forking mode
+        // <https://github.com/foundry-rs/foundry/issues/6036>
+        self.on_blocking_task(|this| async move {
+            let simulated_blocks = this.backend.simulate(request, Some(block_request)).await?;
+            trace!(target : "node", "Simulate status {:?}", simulated_blocks);
+
+            Ok(simulated_blocks)
+        })
+        .await
+    }
+
     /// This method creates an EIP2930 type accessList based on a given Transaction. The accessList
     /// contains all storage slots and addresses read and written by the transaction, except for the
     /// sender account and the precompiles.
@@ -1185,24 +1219,24 @@ impl EthApi {
     /// this will also scan the mempool for a matching pending transaction
     ///
     /// Handler for ETH RPC call: `eth_getTransactionByHash`
-    pub async fn transaction_by_hash(
-        &self,
-        hash: B256,
-    ) -> Result<Option<WithOtherFields<Transaction>>> {
+    pub async fn transaction_by_hash(&self, hash: B256) -> Result<Option<AnyRpcTransaction>> {
         node_info!("eth_getTransactionByHash");
         let mut tx = self.pool.get_transaction(hash).map(|pending| {
             let from = *pending.sender();
-            let mut tx = transaction_build(
+            let tx = transaction_build(
                 Some(*pending.hash()),
                 pending.transaction,
                 None,
                 None,
                 Some(self.backend.base_fee()),
             );
+
+            let WithOtherFields { inner: mut tx, other } = tx.0;
             // we set the from field here explicitly to the set sender of the pending transaction,
             // in case the transaction is impersonated.
-            tx.from = from;
-            tx
+            tx.inner = Recovered::new_unchecked(tx.inner.into_inner(), from);
+
+            AnyRpcTransaction(WithOtherFields { inner: tx, other })
         });
         if tx.is_none() {
             tx = self.backend.transaction_by_hash(hash).await?
@@ -1218,7 +1252,7 @@ impl EthApi {
         &self,
         hash: B256,
         index: Index,
-    ) -> Result<Option<WithOtherFields<Transaction>>> {
+    ) -> Result<Option<AnyRpcTransaction>> {
         node_info!("eth_getTransactionByBlockHashAndIndex");
         self.backend.transaction_by_block_hash_and_index(hash, index).await
     }
@@ -1230,7 +1264,7 @@ impl EthApi {
         &self,
         block: BlockNumber,
         idx: Index,
-    ) -> Result<Option<WithOtherFields<Transaction>>> {
+    ) -> Result<Option<AnyRpcTransaction>> {
         node_info!("eth_getTransactionByBlockNumberAndIndex");
         self.backend.transaction_by_block_number_and_index(block, idx).await
     }
@@ -1262,7 +1296,7 @@ impl EthApi {
         &self,
         block_hash: B256,
         idx: Index,
-    ) -> Result<Option<AnyNetworkBlock>> {
+    ) -> Result<Option<AnyRpcBlock>> {
         node_info!("eth_getUncleByBlockHashAndIndex");
         let number =
             self.backend.ensure_block_number(Some(BlockId::Hash(block_hash.into()))).await?;
@@ -1282,7 +1316,7 @@ impl EthApi {
         &self,
         block_number: BlockNumber,
         idx: Index,
-    ) -> Result<Option<AnyNetworkBlock>> {
+    ) -> Result<Option<AnyRpcBlock>> {
         node_info!("eth_getUncleByBlockNumberAndIndex");
         let number = self.backend.ensure_block_number(Some(BlockId::Number(block_number))).await?;
         if let Some(fork) = self.get_fork() {
@@ -1544,7 +1578,7 @@ impl EthApi {
     ) -> Result<Option<Bytes>> {
         node_info!("eth_getRawTransactionByBlockHashAndIndex");
         match self.backend.transaction_by_block_hash_and_index(block_hash, index).await? {
-            Some(tx) => self.inner_raw_transaction(tx.hash).await,
+            Some(tx) => self.inner_raw_transaction(tx.tx_hash()).await,
             None => Ok(None),
         }
     }
@@ -1559,7 +1593,7 @@ impl EthApi {
     ) -> Result<Option<Bytes>> {
         node_info!("eth_getRawTransactionByBlockNumberAndIndex");
         match self.backend.transaction_by_block_number_and_index(block_number, index).await? {
-            Some(tx) => self.inner_raw_transaction(tx.hash).await,
+            Some(tx) => self.inner_raw_transaction(tx.tx_hash()).await,
             None => Ok(None),
         }
     }
@@ -1914,10 +1948,10 @@ impl EthApi {
                 TransactionOrder::Fees => "fees".to_string(),
             },
             environment: NodeEnvironment {
-                base_fee: U256::from(self.backend.base_fee()),
+                base_fee: self.backend.base_fee() as u128,
                 chain_id: self.backend.chain_id().to::<u64>(),
-                gas_limit: U256::from(self.backend.gas_limit()),
-                gas_price: U256::from(self.gas_price()),
+                gas_limit: self.backend.gas_limit(),
+                gas_price: self.gas_price(),
             },
             fork_config: fork_config
                 .map(|fork| {
@@ -2079,6 +2113,36 @@ impl EthApi {
         Ok(())
     }
 
+    /// Rollback the chain to a specific depth.
+    ///
+    /// e.g depth = 3
+    ///     A  -> B  -> C  -> D  -> E
+    ///     A  -> B
+    ///
+    /// Depth specifies the height to rollback the chain back to. Depth must not exceed the current
+    /// chain height, i.e. can't rollback past the genesis block.
+    ///
+    /// Handler for RPC call: `anvil_rollback`
+    pub async fn anvil_rollback(&self, depth: Option<u64>) -> Result<()> {
+        node_info!("anvil_rollback");
+        let depth = depth.unwrap_or(1);
+
+        // Check reorg depth doesn't exceed current chain height
+        let current_height = self.backend.best_number();
+        let common_height = current_height.checked_sub(depth).ok_or(BlockchainError::RpcError(
+            RpcError::invalid_params(format!(
+                "Rollback depth must not exceed current chain height: current height {current_height}, depth {depth}"
+            )),
+        ))?;
+
+        // Get the common ancestor block
+        let common_block =
+            self.backend.get_block(common_height).ok_or(BlockchainError::BlockNotFound)?;
+
+        self.backend.rollback(common_block).await?;
+        Ok(())
+    }
+
     /// Snapshot the state of the blockchain at the current block.
     ///
     /// Handler for RPC call: `evm_snapshot`
@@ -2175,10 +2239,7 @@ impl EthApi {
     /// **Note**: This behaves exactly as [Self::evm_mine] but returns different output, for
     /// compatibility reasons, this is a separate call since `evm_mine` is not an anvil original.
     /// and `ganache` may change the `0x0` placeholder.
-    pub async fn evm_mine_detailed(
-        &self,
-        opts: Option<MineOptions>,
-    ) -> Result<Vec<AnyNetworkBlock>> {
+    pub async fn evm_mine_detailed(&self, opts: Option<MineOptions>) -> Result<Vec<AnyRpcBlock>> {
         node_info!("evm_mine_detailed");
 
         let mined_blocks = self.do_evm_mine(opts).await?;
@@ -2196,7 +2257,7 @@ impl EthApi {
                     BlockTransactions::Hashes(_) | BlockTransactions::Uncle => unreachable!(),
                 };
                 for tx in block_txs.iter_mut() {
-                    if let Some(receipt) = self.backend.mined_transaction_receipt(tx.hash) {
+                    if let Some(receipt) = self.backend.mined_transaction_receipt(tx.tx_hash()) {
                         if let Some(output) = receipt.out {
                             // insert revert reason if failure
                             if !receipt
@@ -2330,7 +2391,7 @@ impl EthApi {
             let to = tx.to();
             let gas_price = tx.gas_price();
             let value = tx.value();
-            let gas = tx.gas_limit() as u128;
+            let gas = tx.gas_limit();
             TxpoolInspectSummary { to, value, gas, gas_price }
         }
 
@@ -2359,12 +2420,12 @@ impl EthApi {
     /// See [here](https://geth.ethereum.org/docs/rpc/ns-txpool#txpool_content) for more details
     ///
     /// Handler for ETH RPC call: `txpool_inspect`
-    pub async fn txpool_content(&self) -> Result<TxpoolContent> {
+    pub async fn txpool_content(&self) -> Result<TxpoolContent<AnyRpcTransaction>> {
         node_info!("txpool_content");
-        let mut content = TxpoolContent::default();
-        fn convert(tx: Arc<PoolTransaction>) -> Transaction {
+        let mut content = TxpoolContent::<AnyRpcTransaction>::default();
+        fn convert(tx: Arc<PoolTransaction>) -> Result<AnyRpcTransaction> {
             let from = *tx.pending_transaction.sender();
-            let mut tx = transaction_build(
+            let tx = transaction_build(
                 Some(tx.hash()),
                 tx.pending_transaction.transaction.clone(),
                 None,
@@ -2372,21 +2433,26 @@ impl EthApi {
                 None,
             );
 
+            let WithOtherFields { inner: mut tx, other } = tx.0;
+
             // we set the from field here explicitly to the set sender of the pending transaction,
             // in case the transaction is impersonated.
-            tx.from = from;
-            tx.inner
+            tx.inner = Recovered::new_unchecked(tx.inner.into_inner(), from);
+
+            let tx = AnyRpcTransaction(WithOtherFields { inner: tx, other });
+
+            Ok(tx)
         }
 
         for pending in self.pool.ready_transactions() {
             let entry = content.pending.entry(*pending.pending_transaction.sender()).or_default();
             let key = pending.pending_transaction.nonce().to_string();
-            entry.insert(key, convert(pending));
+            entry.insert(key, convert(pending)?);
         }
         for queued in self.pool.pending_transactions() {
             let entry = content.pending.entry(*queued.pending_transaction.sender()).or_default();
             let key = queued.pending_transaction.nonce().to_string();
-            entry.insert(key, convert(queued));
+            entry.insert(key, convert(queued)?);
         }
 
         Ok(content)
@@ -2768,7 +2834,7 @@ impl EthApi {
     }
 
     /// Returns the first signer that can sign for the given address
-    #[allow(clippy::borrowed_box)]
+    #[expect(clippy::borrowed_box)]
     pub fn get_signer(&self, address: Address) -> Option<&Box<dyn Signer>> {
         self.signers.iter().find(|signer| signer.is_signer_for(address))
     }
@@ -2803,14 +2869,14 @@ impl EthApi {
     }
 
     /// Returns the pending block with tx hashes
-    async fn pending_block(&self) -> AnyNetworkBlock {
+    async fn pending_block(&self) -> AnyRpcBlock {
         let transactions = self.pool.ready_transactions().collect::<Vec<_>>();
         let info = self.backend.pending_block(transactions).await;
         self.backend.convert_block(info.block)
     }
 
     /// Returns the full pending block with `Transaction` objects
-    async fn pending_block_full(&self) -> Option<AnyNetworkBlock> {
+    async fn pending_block_full(&self) -> Option<AnyRpcBlock> {
         let transactions = self.pool.ready_transactions().collect::<Vec<_>>();
         let BlockInfo { block, transactions, receipts: _ } =
             self.backend.pending_block(transactions).await;
@@ -2848,7 +2914,8 @@ impl EthApi {
         let max_fee_per_blob_gas = request.max_fee_per_blob_gas;
         let gas_price = request.gas_price;
 
-        let gas_limit = request.gas.unwrap_or(self.backend.gas_limit() as u64);
+        let gas_limit = request.gas.unwrap_or_else(|| self.backend.gas_limit());
+        let from = request.from;
 
         let request = match transaction_request_to_typed(request) {
             Some(TypedTransactionRequest::Legacy(mut m)) => {
@@ -2896,10 +2963,26 @@ impl EthApi {
                         }
                         TxEip4844Variant::TxEip4844WithSidecar(m)
                     }
-                    // It is not valid to receive a TxEip4844 without a sidecar, therefore
-                    // we must reject it.
-                    TxEip4844Variant::TxEip4844(_) => {
-                        return Err(BlockchainError::FailedToDecodeTransaction)
+                    TxEip4844Variant::TxEip4844(mut tx) => {
+                        if !self.backend.skip_blob_validation(from) {
+                            return Err(BlockchainError::FailedToDecodeTransaction)
+                        }
+
+                        // Allows 4844 with no sidecar when impersonation is active.
+                        tx.nonce = nonce;
+                        tx.chain_id = chain_id;
+                        tx.gas_limit = gas_limit;
+                        if max_fee_per_gas.is_none() {
+                            tx.max_fee_per_gas = self.gas_price();
+                        }
+                        if max_fee_per_blob_gas.is_none() {
+                            tx.max_fee_per_blob_gas = self
+                                .excess_blob_gas_and_price()
+                                .unwrap_or_default()
+                                .map_or(0, |g| g.blob_gasprice)
+                        }
+
+                        TxEip4844Variant::TxEip4844(tx)
                     }
                 })
             }
@@ -2925,7 +3008,7 @@ impl EthApi {
             TypedTransactionRequest::Legacy(_) => Signature::from_scalars_and_parity(
                 B256::with_last_byte(1),
                 B256::with_last_byte(1),
-                Parity::NonEip155(false),
+                false,
             ),
             TypedTransactionRequest::EIP2930(_) |
             TypedTransactionRequest::EIP1559(_) |
@@ -2933,10 +3016,9 @@ impl EthApi {
             TypedTransactionRequest::Deposit(_) => Signature::from_scalars_and_parity(
                 B256::with_last_byte(1),
                 B256::with_last_byte(1),
-                Parity::Parity(false),
+                false,
             ),
         }
-        .unwrap()
     }
 
     /// Returns the nonce of the `address` depending on the `block_number`

@@ -223,6 +223,14 @@ interface Vm {
         bool reverted;
     }
 
+    /// An EIP-2930 access list item.
+    struct AccessListItem {
+        /// The address to be added in access list.
+        address target;
+        /// The storage keys to be added in access list.
+        bytes32[] storageKeys;
+    }
+
     /// The result of a `stopAndReturnStateDiff` call.
     struct AccountAccess {
         /// The chain and fork the access occurred.
@@ -308,6 +316,34 @@ interface Vm {
         bool success;
     }
 
+    /// Holds a signed EIP-7702 authorization for an authority account to delegate to an implementation.
+    struct SignedDelegation {
+        /// The y-parity of the recovered secp256k1 signature (0 or 1).
+        uint8 v;
+        /// First 32 bytes of the signature.
+        bytes32 r;
+        /// Second 32 bytes of the signature.
+        bytes32 s;
+        /// The current nonce of the authority account at signing time.
+        /// Used to ensure signature can't be replayed after account nonce changes.
+        uint64 nonce;
+        /// Address of the contract implementation that will be delegated to.
+        /// Gets encoded into delegation code: 0xef0100 || implementation.
+        address implementation;
+    }
+
+    /// Represents a "potential" revert reason from a single subsequent call when using `vm.assumeNoReverts`.
+    /// Reverts that match will result in a FOUNDRY::ASSUME rejection, whereas unmatched reverts will be surfaced
+    /// as normal.
+    struct PotentialRevert {
+        /// The allowed origin of the revert opcode; address(0) allows reverts from any address
+        address reverter;
+        /// When true, only matches on the beginning of the revert data, otherwise, matches on entire revert data
+        bool partialMatch;
+        /// The data to use to match encountered reverts
+        bytes revertData;
+    }
+
     // ======== EVM ========
 
     /// Gets the address for a given private key.
@@ -367,6 +403,14 @@ interface Vm {
     /// Returns an ordered array of all account accesses from a `vm.startStateDiffRecording` session.
     #[cheatcode(group = Evm, safety = Safe)]
     function stopAndReturnStateDiff() external returns (AccountAccess[] memory accountAccesses);
+
+    /// Returns state diffs from current `vm.startStateDiffRecording` session.
+    #[cheatcode(group = Evm, safety = Safe)]
+    function getStateDiff() external view returns (string memory diff);
+
+    /// Returns state diffs from current `vm.startStateDiffRecording` session, in json format.
+    #[cheatcode(group = Evm, safety = Safe)]
+    function getStateDiffJson() external view returns (string memory diff);
 
     // -------- Recording Map Writes --------
 
@@ -505,8 +549,24 @@ interface Vm {
     function store(address target, bytes32 slot, bytes32 value) external;
 
     /// Marks the slots of an account and the account address as cold.
-    #[cheatcode(group = Evm, safety = Unsafe, status = Experimental)]
+    #[cheatcode(group = Evm, safety = Unsafe)]
     function cool(address target) external;
+
+    /// Utility cheatcode to set an EIP-2930 access list for all subsequent transactions.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function accessList(AccessListItem[] calldata access) external;
+
+    /// Utility cheatcode to remove any EIP-2930 access list set by `accessList` cheatcode.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function noAccessList() external;
+
+    /// Utility cheatcode to mark specific storage slot as warm, simulating a prior read.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function warmSlot(address target, bytes32 slot) external;
+
+    /// Utility cheatcode to mark specific storage slot as cold, simulating no prior read.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function coolSlot(address target, bytes32 slot) external;
 
     // -------- Call Manipulation --------
     // --- Mocks ---
@@ -599,6 +659,22 @@ interface Vm {
     /// Sets all subsequent calls' `msg.sender` to be the input address until `stopPrank` is called, and the `tx.origin` to be the second input.
     #[cheatcode(group = Evm, safety = Unsafe)]
     function startPrank(address msgSender, address txOrigin) external;
+
+    /// Sets the *next* delegate call's `msg.sender` to be the input address.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function prank(address msgSender, bool delegateCall) external;
+
+    /// Sets all subsequent delegate calls' `msg.sender` to be the input address until `stopPrank` is called.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function startPrank(address msgSender, bool delegateCall) external;
+
+    /// Sets the *next* delegate call's `msg.sender` to be the input address, and the `tx.origin` to be the second input.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function prank(address msgSender, address txOrigin, bool delegateCall) external;
+
+    /// Sets all subsequent delegate calls' `msg.sender` to be the input address until `stopPrank` is called, and the `tx.origin` to be the second input.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function startPrank(address msgSender, address txOrigin, bool delegateCall) external;
 
     /// Resets subsequent calls' `msg.sender` to be `address(this)`.
     #[cheatcode(group = Evm, safety = Unsafe)]
@@ -776,7 +852,7 @@ interface Vm {
 
     /// Gets all the logs according to specified filter.
     #[cheatcode(group = Evm, safety = Safe)]
-    function eth_getLogs(uint256 fromBlock, uint256 toBlock, address target, bytes32[] memory topics)
+    function eth_getLogs(uint256 fromBlock, uint256 toBlock, address target, bytes32[] calldata topics)
         external
         returns (EthGetLogs[] memory logs);
 
@@ -854,6 +930,14 @@ interface Vm {
     #[cheatcode(group = Testing, safety = Safe)]
     function assumeNoRevert() external pure;
 
+    /// Discard this run's fuzz inputs and generate new ones if next call reverts with the potential revert parameters.
+    #[cheatcode(group = Testing, safety = Safe)]
+    function assumeNoRevert(PotentialRevert calldata potentialRevert) external pure;
+
+    /// Discard this run's fuzz inputs and generate new ones if next call reverts with the any of the potential revert parameters.
+    #[cheatcode(group = Testing, safety = Safe)]
+    function assumeNoRevert(PotentialRevert[] calldata potentialReverts) external pure;
+
     /// Writes a breakpoint to jump to in the debugger.
     #[cheatcode(group = Testing, safety = Safe)]
     function breakpoint(string calldata char) external pure;
@@ -863,10 +947,10 @@ interface Vm {
     function breakpoint(string calldata char, bool value) external pure;
 
     /// Returns the Foundry version.
-    /// Format: <cargo_version>+<git_sha>+<build_timestamp>
-    /// Sample output: 0.2.0+faa94c384+202407110019
+    /// Format: <cargo_version>-<tag>+<git_sha_short>.<unix_build_timestamp>.<profile>
+    /// Sample output: 0.3.0-nightly+3cb96bde9b.1737036656.debug
     /// Note: Build timestamps may vary slightly across platforms due to separate CI jobs.
-    /// For reliable version comparisons, use YYYYMMDD0000 format (e.g., >= 202407110000)
+    /// For reliable version comparisons, use UNIX format (e.g., >= 1700000000)
     /// to compare timestamps while ignoring minor time differences.
     #[cheatcode(group = Testing, safety = Safe)]
     function getFoundryVersion() external view returns (string memory version);
@@ -942,6 +1026,23 @@ interface Vm {
     #[cheatcode(group = Testing, safety = Unsafe)]
     function expectEmit(address emitter) external;
 
+    /// Expect a given number of logs with the provided topics.
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectEmit(bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData, uint64 count) external;
+
+    /// Expect a given number of logs from a specific emitter with the provided topics.
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectEmit(bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData, address emitter, uint64 count)
+        external;
+
+    /// Expect a given number of logs with all topic and data checks enabled.
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectEmit(uint64 count) external;
+
+    /// Expect a given number of logs from a specific emitter with all topic and data checks enabled.
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectEmit(address emitter, uint64 count) external;
+
     /// Prepare an expected anonymous log with (bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData.).
     /// Call this function, then emit an anonymous event, then call a function. Internally after the call, we check if
     /// logs were emitted in the expected order with the expected topics and data (as specified by the booleans).
@@ -962,6 +1063,14 @@ interface Vm {
     /// Same as the previous method, but also checks supplied address against emitting contract.
     #[cheatcode(group = Testing, safety = Unsafe)]
     function expectEmitAnonymous(address emitter) external;
+
+    /// Expects the deployment of the specified bytecode by the specified address using the CREATE opcode
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectCreate(bytes calldata bytecode, address deployer) external;
+
+    /// Expects the deployment of the specified bytecode by the specified address using the CREATE2 opcode
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectCreate2(bytes calldata bytecode, address deployer) external;
 
     /// Expects an error on next call with any revert data.
     #[cheatcode(group = Testing, safety = Unsafe)]
@@ -986,6 +1095,30 @@ interface Vm {
     /// Expects an error from reverter address on next call, that exactly matches the revert data.
     #[cheatcode(group = Testing, safety = Unsafe)]
     function expectRevert(bytes calldata revertData, address reverter) external;
+
+    /// Expects a `count` number of reverts from the upcoming calls with any revert data or reverter.
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectRevert(uint64 count) external;
+
+    /// Expects a `count` number of reverts from the upcoming calls that match the revert data.
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectRevert(bytes4 revertData, uint64 count) external;
+
+    /// Expects a `count` number of reverts from the upcoming calls that exactly match the revert data.
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectRevert(bytes calldata revertData, uint64 count) external;
+
+    /// Expects a `count` number of reverts from the upcoming calls from the reverter address.
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectRevert(address reverter, uint64 count) external;
+
+    /// Expects a `count` number of reverts from the upcoming calls from the reverter address that match the revert data.
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectRevert(bytes4 revertData, address reverter, uint64 count) external;
+
+    /// Expects a `count` number of reverts from the upcoming calls from the reverter address that exactly match the revert data.
+    #[cheatcode(group = Testing, safety = Unsafe)]
+    function expectRevert(bytes calldata revertData, address reverter, uint64 count) external;
 
     /// Expects an error on next call that starts with the revert data.
     #[cheatcode(group = Testing, safety = Unsafe)]
@@ -1576,6 +1709,27 @@ interface Vm {
         string calldata error
     ) external pure;
 
+    /// Returns true if the current Foundry version is greater than or equal to the given version.
+    /// The given version string must be in the format `major.minor.patch`.
+    ///
+    /// This is equivalent to `foundryVersionCmp(version) >= 0`.
+    #[cheatcode(group = Testing, safety = Safe)]
+    function foundryVersionAtLeast(string calldata version) external view returns (bool);
+
+    /// Compares the current Foundry version with the given version string.
+    /// The given version string must be in the format `major.minor.patch`.
+    ///
+    /// Returns:
+    /// -1 if current Foundry version is less than the given version
+    /// 0 if current Foundry version equals the given version
+    /// 1 if current Foundry version is greater than the given version
+    ///
+    /// This result can then be used with a comparison operator against `0`.
+    /// For example, to check if the current Foundry version is greater than or equal to `1.0.0`:
+    /// `if (foundryVersionCmp("1.0.0") >= 0) { ... }`
+    #[cheatcode(group = Testing, safety = Safe)]
+    function foundryVersionCmp(string calldata version) external view returns (int256);
+
     // ======== OS and Filesystem ========
 
     // -------- Metadata --------
@@ -1719,6 +1873,46 @@ interface Vm {
     #[cheatcode(group = Filesystem)]
     function deployCode(string calldata artifactPath, bytes calldata constructorArgs) external returns (address deployedAddress);
 
+    /// Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the
+    /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    ///
+    /// Additionally accepts `msg.value`.
+    #[cheatcode(group = Filesystem)]
+    function deployCode(string calldata artifactPath, uint256 value) external returns (address deployedAddress);
+
+    /// Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the
+    /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    ///
+    /// Additionally accepts abi-encoded constructor arguments and `msg.value`.
+    #[cheatcode(group = Filesystem)]
+    function deployCode(string calldata artifactPath, bytes calldata constructorArgs, uint256 value) external returns (address deployedAddress);
+
+    /// Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the
+    /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    #[cheatcode(group = Filesystem)]
+    function deployCode(string calldata artifactPath, bytes32 salt) external returns (address deployedAddress);
+
+    /// Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the
+    /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    ///
+    /// Additionally accepts abi-encoded constructor arguments.
+    #[cheatcode(group = Filesystem)]
+    function deployCode(string calldata artifactPath, bytes calldata constructorArgs, bytes32 salt) external returns (address deployedAddress);
+
+    /// Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the
+    /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    ///
+    /// Additionally accepts `msg.value`.
+    #[cheatcode(group = Filesystem)]
+    function deployCode(string calldata artifactPath, uint256 value, bytes32 salt) external returns (address deployedAddress);
+
+    /// Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the
+    /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    ///
+    /// Additionally accepts abi-encoded constructor arguments and `msg.value`.
+    #[cheatcode(group = Filesystem)]
+    function deployCode(string calldata artifactPath, bytes calldata constructorArgs, uint256 value, bytes32 salt) external returns (address deployedAddress);
+
     /// Gets the deployed bytecode from an artifact file. Takes in the relative path to the json file or the path to the
     /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
     #[cheatcode(group = Filesystem)]
@@ -1732,27 +1926,27 @@ interface Vm {
     ///
     /// The most recent call can be fetched by passing `txType` as `CALL`.
     #[cheatcode(group = Filesystem)]
-    function getBroadcast(string memory contractName, uint64 chainId, BroadcastTxType txType) external view returns (BroadcastTxSummary memory);
+    function getBroadcast(string calldata contractName, uint64 chainId, BroadcastTxType txType) external view returns (BroadcastTxSummary memory);
 
     /// Returns all broadcasts for the given contract on `chainId` with the specified `txType`.
     ///
     /// Sorted such that the most recent broadcast is the first element, and the oldest is the last. i.e descending order of BroadcastTxSummary.blockNumber.
     #[cheatcode(group = Filesystem)]
-    function getBroadcasts(string memory contractName, uint64 chainId, BroadcastTxType txType) external view returns (BroadcastTxSummary[] memory);
+    function getBroadcasts(string calldata contractName, uint64 chainId, BroadcastTxType txType) external view returns (BroadcastTxSummary[] memory);
 
     /// Returns all broadcasts for the given contract on `chainId`.
     ///
     /// Sorted such that the most recent broadcast is the first element, and the oldest is the last. i.e descending order of BroadcastTxSummary.blockNumber.
     #[cheatcode(group = Filesystem)]
-    function getBroadcasts(string memory contractName, uint64 chainId) external view returns (BroadcastTxSummary[] memory);
+    function getBroadcasts(string calldata contractName, uint64 chainId) external view returns (BroadcastTxSummary[] memory);
 
     /// Returns the most recent deployment for the current `chainId`.
     #[cheatcode(group = Filesystem)]
-    function getDeployment(string memory contractName) external view returns (address deployedAddress);
+    function getDeployment(string calldata contractName) external view returns (address deployedAddress);
 
     /// Returns the most recent deployment for the given contract on `chainId`
     #[cheatcode(group = Filesystem)]
-    function getDeployment(string memory contractName, uint64 chainId) external view returns (address deployedAddress);
+    function getDeployment(string calldata contractName, uint64 chainId) external view returns (address deployedAddress);
 
     /// Returns all deployments for the given contract on `chainId`
     ///
@@ -1760,7 +1954,7 @@ interface Vm {
     ///
     /// The most recent deployment is the first element, and the oldest is the last.
     #[cheatcode(group = Filesystem)]
-    function getDeployments(string memory contractName, uint64 chainId) external view returns (address[] memory deployedAddresses);
+    function getDeployments(string calldata contractName, uint64 chainId) external view returns (address[] memory deployedAddresses);
 
     // -------- Foreign Function Interface --------
 
@@ -2001,6 +2195,26 @@ interface Vm {
     /// Takes a signed transaction and broadcasts it to the network.
     #[cheatcode(group = Scripting)]
     function broadcastRawTransaction(bytes calldata data) external;
+
+    /// Sign an EIP-7702 authorization for delegation
+    #[cheatcode(group = Scripting)]
+    function signDelegation(address implementation, uint256 privateKey) external returns (SignedDelegation memory signedDelegation);
+
+    /// Sign an EIP-7702 authorization for delegation for specific nonce
+    #[cheatcode(group = Scripting)]
+    function signDelegation(address implementation, uint256 privateKey, uint64 nonce) external returns (SignedDelegation memory signedDelegation);
+
+    /// Designate the next call as an EIP-7702 transaction
+    #[cheatcode(group = Scripting)]
+    function attachDelegation(SignedDelegation calldata signedDelegation) external;
+
+    /// Sign an EIP-7702 authorization and designate the next call as an EIP-7702 transaction
+    #[cheatcode(group = Scripting)]
+    function signAndAttachDelegation(address implementation, uint256 privateKey) external returns (SignedDelegation memory signedDelegation);
+
+    /// Sign an EIP-7702 authorization and designate the next call as an EIP-7702 transaction for specific nonce
+    #[cheatcode(group = Scripting)]
+    function signAndAttachDelegation(address implementation, uint256 privateKey, uint64 nonce) external returns (SignedDelegation memory signedDelegation);
 
     /// Returns addresses of available unlocked wallets in the script environment.
     #[cheatcode(group = Scripting)]
@@ -2254,13 +2468,13 @@ interface Vm {
         returns (string memory json);
     /// See `serializeJson`.
     #[cheatcode(group = Json)]
-    function serializeJsonType(string calldata typeDescription, bytes memory value)
+    function serializeJsonType(string calldata typeDescription, bytes calldata value)
         external
         pure
         returns (string memory json);
     /// See `serializeJson`.
     #[cheatcode(group = Json)]
-    function serializeJsonType(string calldata objectKey, string calldata valueKey, string calldata typeDescription, bytes memory value)
+    function serializeJsonType(string calldata objectKey, string calldata valueKey, string calldata typeDescription, bytes calldata value)
         external
         returns (string memory json);
 
@@ -2611,6 +2825,19 @@ interface Vm {
     /// Utility cheatcode to set arbitrary storage for given target address.
     #[cheatcode(group = Utilities)]
     function setArbitraryStorage(address target) external;
+
+    /// Utility cheatcode to set arbitrary storage for given target address and overwrite
+    /// any storage slots that have been previously set.
+    #[cheatcode(group = Utilities)]
+    function setArbitraryStorage(address target, bool overwrite) external;
+
+    /// Sorts an array in ascending order.
+    #[cheatcode(group = Utilities)]
+    function sort(uint256[] calldata array) external returns (uint256[] memory);
+
+    /// Randomly shuffles an array.
+    #[cheatcode(group = Utilities)]
+    function shuffle(uint256[] calldata array) external returns (uint256[] memory);
 }
 }
 

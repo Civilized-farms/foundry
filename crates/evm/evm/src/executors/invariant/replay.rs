@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 /// Replays a call sequence for collecting logs and traces.
 /// Returns counterexample to be used when the call sequence is a failed scenario.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn replay_run(
     invariant_contract: &InvariantContract<'_>,
     mut executor: Executor,
@@ -32,6 +32,7 @@ pub fn replay_run(
     coverage: &mut Option<HitMaps>,
     deprecated_cheatcodes: &mut HashMap<&'static str, Option<&'static str>>,
     inputs: &[BasicTxDetails],
+    show_solidity: bool,
 ) -> Result<Vec<BaseCounterExample>> {
     // We want traces for a failed case.
     if executor.inspector().tracer.is_none() {
@@ -48,16 +49,10 @@ pub fn replay_run(
             tx.call_details.calldata.clone(),
             U256::ZERO,
         )?;
+
         logs.extend(call_result.logs);
         traces.push((TraceKind::Execution, call_result.traces.clone().unwrap()));
-
-        if let Some(new_coverage) = call_result.coverage {
-            if let Some(old_coverage) = coverage {
-                *coverage = Some(std::mem::take(old_coverage).merged(new_coverage));
-            } else {
-                *coverage = Some(new_coverage);
-            }
-        }
+        HitMaps::merge_opt(coverage, call_result.coverage);
 
         // Identify newly generated contracts, if they exist.
         ided_contracts
@@ -70,6 +65,7 @@ pub fn replay_run(
             &tx.call_details.calldata,
             &ided_contracts,
             call_result.traces,
+            show_solidity,
         ));
     }
 
@@ -104,7 +100,7 @@ pub fn replay_run(
 }
 
 /// Replays the error case, shrinks the failing sequence and collects all necessary traces.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn replay_error(
     failed_case: &FailedInvariantCaseData,
     invariant_contract: &InvariantContract<'_>,
@@ -116,6 +112,7 @@ pub fn replay_error(
     coverage: &mut Option<HitMaps>,
     deprecated_cheatcodes: &mut HashMap<&'static str, Option<&'static str>>,
     progress: Option<&ProgressBar>,
+    show_solidity: bool,
 ) -> Result<Vec<BaseCounterExample>> {
     match failed_case.test_error {
         // Don't use at the moment.
@@ -143,6 +140,7 @@ pub fn replay_error(
                 coverage,
                 deprecated_cheatcodes,
                 &calls,
+                show_solidity,
             )
         }
     }

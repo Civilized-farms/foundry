@@ -1,23 +1,47 @@
 //! Contains various tests for checking cast commands
 
 use alloy_chains::NamedChain;
-use alloy_primitives::{b256, B256};
+use alloy_network::{TransactionBuilder, TransactionResponse};
+use alloy_primitives::{address, b256, Bytes, B256};
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types::{BlockNumberOrTag, Index, TransactionRequest};
 use anvil::{EthereumHardfork, NodeConfig};
 use foundry_test_utils::{
-    casttest, file,
     rpc::{
-        next_http_rpc_endpoint, next_mainnet_etherscan_api_key, next_rpc_endpoint,
-        next_ws_rpc_endpoint,
+        next_etherscan_api_key, next_http_archive_rpc_url, next_http_rpc_endpoint,
+        next_mainnet_etherscan_api_key, next_rpc_endpoint, next_ws_rpc_endpoint,
     },
     str,
     util::OutputExt,
 };
 use std::{fs, io::Write, path::Path, str::FromStr};
 
+#[macro_use]
+extern crate foundry_test_utils;
+
+mod selectors;
+
+casttest!(print_short_version, |_prj, cmd| {
+    cmd.arg("-V").assert_success().stdout_eq(str![[r#"
+cast [..]-[..] ([..] [..])
+
+"#]]);
+});
+
+casttest!(print_long_version, |_prj, cmd| {
+    cmd.arg("--version").assert_success().stdout_eq(str![[r#"
+cast Version: [..]
+Commit SHA: [..]
+Build Timestamp: [..]
+Build Profile: [..]
+
+"#]]);
+});
+
 // tests `--help` is printed to std out
 casttest!(print_help, |_prj, cmd| {
     cmd.arg("--help").assert_success().stdout_eq(str![[r#"
-Perform Ethereum RPC calls from the comfort of your command line
+A Swiss Army knife for interacting with Ethereum applications from the command line
 
 Usage: cast[..] <COMMAND>
 
@@ -28,12 +52,17 @@ Options:
   -h, --help
           Print help (see a summary with '-h')
 
+  -j, --threads <THREADS>
+          Number of threads to use. Specifying 0 defaults to the number of logical cores
+          
+          [aliases: jobs]
+
   -V, --version
           Print version
 
 Display options:
       --color <COLOR>
-          Log messages coloring
+          The color of the log messages
 
           Possible values:
           - auto:   Intelligently guess whether to use color output (default)
@@ -46,8 +75,18 @@ Display options:
   -q, --quiet
           Do not print log messages
 
-      --verbose
-          Use verbose output
+  -v, --verbosity...
+          Verbosity level of the log messages.
+          
+          Pass multiple times to increase the verbosity (e.g. -v, -vv, -vvv).
+          
+          Depending on the context the verbosity levels have different meanings.
+          
+          For example, the verbosity levels of the EVM are:
+          - 2 (-vv): Print logs for all tests.
+          - 3 (-vvv): Print execution traces for failing tests.
+          - 4 (-vvvv): Print execution traces for all tests, and setup traces for failing tests.
+          - 5 (-vvvvv): Print execution and setup traces for all tests, including storage changes.
 
 Find more information in the book: http://book.getfoundry.sh/reference/cast/cast.html
 
@@ -119,13 +158,13 @@ casttest!(finds_block, |_prj, cmd| {
 
 // tests that we can create a new wallet with keystore
 casttest!(new_wallet_keystore_with_password, |_prj, cmd| {
-    cmd.args(["wallet", "new", ".", "--unsafe-password", "test"]).assert_success().stdout_eq(str![
-        [r#"
+    cmd.args(["wallet", "new", ".", "test-account", "--unsafe-password", "test"])
+        .assert_success()
+        .stdout_eq(str![[r#"
 Created new encrypted keystore file: [..]
 [ADDRESS]
 
-"#]
-    ]);
+"#]]);
 });
 
 // tests that we can get the address of a keystore file
@@ -148,6 +187,62 @@ casttest!(wallet_address_keystore_with_password_file, |_prj, cmd| {
 0xeC554aeAFE75601AaAb43Bd4621A22284dB566C2
 
 "#]]);
+});
+
+// tests that `cast wallet remove` can successfully remove a keystore file and validates password
+casttest!(wallet_remove_keystore_with_unsafe_password, |prj, cmd| {
+    let keystore_path = prj.root().join("keystore");
+
+    cmd.set_current_dir(prj.root());
+
+    let account_name = "testAccount";
+
+    // Default Anvil private key
+    let test_private_key =
+        b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+
+    // import private key
+    cmd.cast_fuse()
+        .args([
+            "wallet",
+            "import",
+            account_name,
+            "--private-key",
+            &test_private_key.to_string(),
+            "-k",
+            "keystore",
+            "--unsafe-password",
+            "test",
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+`testAccount` keystore was saved successfully. [ADDRESS]
+
+"#]]);
+
+    // check that the keystore file was created
+    let keystore_file = keystore_path.join(account_name);
+
+    assert!(keystore_file.exists());
+    // Remove the wallet
+    cmd.cast_fuse()
+        .args([
+            "wallet",
+            "remove",
+            "--name",
+            account_name,
+            "--dir",
+            keystore_path.to_str().unwrap(),
+            "--unsafe-password",
+            "test",
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+`testAccount` keystore was removed successfully.
+
+"#]]);
+
+    assert!(!keystore_file.exists());
 });
 
 // tests that `cast wallet sign message` outputs the expected signature
@@ -405,7 +500,20 @@ casttest!(wallet_private_key_from_mnemonic_option, |_prj, cmd| {
 
 "#]]);
 });
+// tests that `cast wallet public-key` correctly derives and outputs the public key
+casttest!(wallet_public_key_with_private_key, |_prj, cmd| {
+    cmd.args([
+        "wallet",
+        "public-key",
+        "--raw-private-key",
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+0xba5734d8f7091719471e7f7ed6b9df170dc70cc661ca05e688601ad984f068b0d67351e5f06073092499336ab0839ef8a521afd334e53807205fa2f08eec74f4
 
+"#]]);
+});
 // tests that `cast wallet private-key` with derivation path outputs the private key
 casttest!(wallet_private_key_with_derivation_path, |_prj, cmd| {
     cmd.args([
@@ -434,7 +542,7 @@ casttest!(wallet_import_and_decrypt, |prj, cmd| {
 
     // Default Anvil private key
     let test_private_key =
-        b256!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 
     // import private key
     cmd.cast_fuse()
@@ -477,6 +585,93 @@ casttest!(wallet_import_and_decrypt, |prj, cmd| {
     // check that the decrypted private key matches the imported private key
     let decrypted_private_key = B256::from_str(private_key_string).unwrap();
     // the form
+    assert_eq!(decrypted_private_key, test_private_key);
+});
+
+// tests that `cast wallet change-password` can successfully change the password of a keystore file
+casttest!(wallet_change_password, |prj, cmd| {
+    let keystore_path = prj.root().join("keystore");
+
+    cmd.set_current_dir(prj.root());
+
+    let account_name = "testAccount";
+
+    // Default Anvil private key
+    let test_private_key =
+        b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+
+    // import private key with initial password
+    cmd.cast_fuse()
+        .args([
+            "wallet",
+            "import",
+            account_name,
+            "--private-key",
+            &test_private_key.to_string(),
+            "-k",
+            "keystore",
+            "--unsafe-password",
+            "old_password",
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+`testAccount` keystore was saved successfully. [ADDRESS]
+
+"#]]);
+
+    // check that the keystore file was created
+    let keystore_file = keystore_path.join(account_name);
+    assert!(keystore_file.exists());
+
+    // change the password
+    cmd.cast_fuse()
+        .args([
+            "wallet",
+            "change-password",
+            account_name,
+            "--keystore-dir",
+            "keystore",
+            "--unsafe-password",
+            "old_password",
+            "--unsafe-new-password",
+            "new_password",
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+Password for keystore `testAccount` was changed successfully. [ADDRESS]
+
+"#]]);
+
+    // verify the old password no longer works
+    cmd.cast_fuse()
+        .args([
+            "wallet",
+            "decrypt-keystore",
+            account_name,
+            "-k",
+            "keystore",
+            "--unsafe-password",
+            "old_password",
+        ])
+        .assert_failure();
+
+    // verify the new password works
+    let decrypt_output = cmd.cast_fuse().args([
+        "wallet",
+        "decrypt-keystore",
+        account_name,
+        "-k",
+        "keystore",
+        "--unsafe-password",
+        "new_password",
+    ]);
+
+    // get the PK out of the output (last word in the output)
+    let decrypt_output = decrypt_output.assert_success().get_output().stdout_lossy();
+    let private_key_string = decrypt_output.split_whitespace().last().unwrap();
+
+    // check that the decrypted private key matches the imported private key
+    let decrypted_private_key = B256::from_str(private_key_string).unwrap();
     assert_eq!(decrypted_private_key, test_private_key);
 });
 
@@ -530,68 +725,6 @@ casttest!(estimate_contract_deploy_gas, |_prj, cmd| {
     assert!(output > 0);
 });
 
-// tests that the `cast upload-signatures` command works correctly
-casttest!(upload_signatures, |_prj, cmd| {
-    // test no prefix is accepted as function
-    let output = cmd
-        .args(["upload-signature", "transfer(address,uint256)"])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
-    assert!(output.contains("Function transfer(address,uint256): 0xa9059cbb"), "{}", output);
-
-    // test event prefix
-    cmd.args(["upload-signature", "event Transfer(address,uint256)"]);
-    let output = cmd.assert_success().get_output().stdout_lossy();
-    assert!(output.contains("Event Transfer(address,uint256): 0x69ca02dd4edd7bf0a4abb9ed3b7af3f14778db5d61921c7dc7cd545266326de2"), "{}", output);
-
-    // test error prefix
-    cmd.args(["upload-signature", "error ERC20InsufficientBalance(address,uint256,uint256)"]);
-    let output = cmd.assert_success().get_output().stdout_lossy();
-    assert!(
-        output.contains("Function ERC20InsufficientBalance(address,uint256,uint256): 0xe450d38c"),
-        "{}",
-        output
-    ); // Custom error is interpreted as function
-
-    // test multiple sigs
-    cmd.args([
-        "upload-signature",
-        "event Transfer(address,uint256)",
-        "transfer(address,uint256)",
-        "approve(address,uint256)",
-    ]);
-    let output = cmd.assert_success().get_output().stdout_lossy();
-    assert!(output.contains("Event Transfer(address,uint256): 0x69ca02dd4edd7bf0a4abb9ed3b7af3f14778db5d61921c7dc7cd545266326de2"), "{}", output);
-    assert!(output.contains("Function transfer(address,uint256): 0xa9059cbb"), "{}", output);
-    assert!(output.contains("Function approve(address,uint256): 0x095ea7b3"), "{}", output);
-
-    // test abi
-    cmd.args([
-        "upload-signature",
-        "event Transfer(address,uint256)",
-        "transfer(address,uint256)",
-        "error ERC20InsufficientBalance(address,uint256,uint256)",
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/ERC20Artifact.json")
-            .into_os_string()
-            .into_string()
-            .unwrap()
-            .as_str(),
-    ]);
-    let output = cmd.assert_success().get_output().stdout_lossy();
-    assert!(output.contains("Event Transfer(address,uint256): 0x69ca02dd4edd7bf0a4abb9ed3b7af3f14778db5d61921c7dc7cd545266326de2"), "{}", output);
-    assert!(output.contains("Function transfer(address,uint256): 0xa9059cbb"), "{}", output);
-    assert!(output.contains("Function approve(address,uint256): 0x095ea7b3"), "{}", output);
-    assert!(output.contains("Function decimals(): 0x313ce567"), "{}", output);
-    assert!(output.contains("Function allowance(address,address): 0xdd62ed3e"), "{}", output);
-    assert!(
-        output.contains("Function ERC20InsufficientBalance(address,uint256,uint256): 0xe450d38c"),
-        "{}",
-        output
-    );
-});
-
 // tests that the `cast to-rlp` and `cast from-rlp` commands work correctly
 casttest!(rlp, |_prj, cmd| {
     cmd.args(["--to-rlp", "[\"0xaa\", [[\"bb\"]], \"0xcc\"]"]).assert_success().stdout_eq(str![[
@@ -604,6 +737,46 @@ casttest!(rlp, |_prj, cmd| {
     cmd.cast_fuse();
     cmd.args(["--from-rlp", "0xcbc58455556666c0c0c2c1c0"]).assert_success().stdout_eq(str![[r#"
 [["0x55556666"],[],[],[[[]]]]
+
+"#]]);
+});
+
+// test that `cast impl` works correctly for both the implementation slot and the beacon slot
+casttest!(impl_slot, |_prj, cmd| {
+    let eth_rpc_url = next_http_archive_rpc_url();
+
+    // Call `cast impl` for the implementation slot (AAVE Proxy)
+    cmd.args([
+        "impl",
+        "0x4965f6FA20fE9728deCf5165016fc338a5a85aBF",
+        "--rpc-url",
+        eth_rpc_url.as_str(),
+        "--block",
+        "21422087",
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+0xb61306c8eb34a2104d9eb8d84f1bb1001067fa4b
+
+"#]]);
+});
+
+casttest!(impl_slot_beacon, |_prj, cmd| {
+    let eth_rpc_url = next_http_archive_rpc_url();
+
+    // Call `cast impl` for the beacon slot
+    cmd.args([
+        "impl",
+        "0xc63d9f0040d35f328274312fc8771a986fc4ba86",
+        "--beacon",
+        "--rpc-url",
+        eth_rpc_url.as_str(),
+        "--block",
+        "21422087",
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+0xa748ae65ba11606492a9c57effa0d4b7be551ec2
 
 "#]]);
 });
@@ -640,9 +813,8 @@ casttest!(rpc_with_args, |_prj, cmd| {
 
     // Call `cast rpc eth_getBlockByNumber 0x123 false`
     cmd.args(["rpc", "--rpc-url", eth_rpc_url.as_str(), "eth_getBlockByNumber", "0x123", "false"])
-        .assert_success()
-        .stdout_eq(str![[r#"
-{"number":"0x123","hash":"0xc5dab4e189004a1312e9db43a40abb2de91ad7dd25e75880bf36016d8e9df524","transactions":[],"totalDifficulty":"0x4dea420908b","logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","extraData":"0x476574682f4c5649562f76312e302e302f6c696e75782f676f312e342e32","nonce":"0x29d6547c196e00e0","miner":"0xbb7b8287f3f0a933474a79eae42cbca977791171","difficulty":"0x494433b31","gasLimit":"0x1388","gasUsed":"0x0","uncles":[],"sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","size":"0x220","transactionsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","stateRoot":"0x3fe6bd17aa85376c7d566df97d9f2e536f37f7a87abb3a6f9e2891cf9442f2e4","mixHash":"0x943056aa305aa6d22a3c06110942980342d1f4d4b11c17711961436a0f963ea0","parentHash":"0x7abfd11e862ccde76d6ea8ee20978aac26f4bcb55de1188cc0335be13e817017","timestamp":"0x55ba4564"}
+    .assert_json_stdout(str![[r#"
+{"number":"0x123","hash":"0xc5dab4e189004a1312e9db43a40abb2de91ad7dd25e75880bf36016d8e9df524","transactions":[],"logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","extraData":"0x476574682f4c5649562f76312e302e302f6c696e75782f676f312e342e32","nonce":"0x29d6547c196e00e0","miner":"0xbb7b8287f3f0a933474a79eae42cbca977791171","difficulty":"0x494433b31","gasLimit":"0x1388","gasUsed":"0x0","uncles":[],"sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","size":"0x220","transactionsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","stateRoot":"0x3fe6bd17aa85376c7d566df97d9f2e536f37f7a87abb3a6f9e2891cf9442f2e4","mixHash":"0x943056aa305aa6d22a3c06110942980342d1f4d4b11c17711961436a0f963ea0","parentHash":"0x7abfd11e862ccde76d6ea8ee20978aac26f4bcb55de1188cc0335be13e817017","timestamp":"0x55ba4564"}
 
 "#]]);
 });
@@ -660,9 +832,8 @@ casttest!(rpc_raw_params, |_prj, cmd| {
         "--raw",
         r#"["0x123", false]"#,
     ])
-    .assert_success()
-    .stdout_eq(str![[r#"
-{"number":"0x123","hash":"0xc5dab4e189004a1312e9db43a40abb2de91ad7dd25e75880bf36016d8e9df524","transactions":[],"totalDifficulty":"0x4dea420908b","logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","extraData":"0x476574682f4c5649562f76312e302e302f6c696e75782f676f312e342e32","nonce":"0x29d6547c196e00e0","miner":"0xbb7b8287f3f0a933474a79eae42cbca977791171","difficulty":"0x494433b31","gasLimit":"0x1388","gasUsed":"0x0","uncles":[],"sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","size":"0x220","transactionsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","stateRoot":"0x3fe6bd17aa85376c7d566df97d9f2e536f37f7a87abb3a6f9e2891cf9442f2e4","mixHash":"0x943056aa305aa6d22a3c06110942980342d1f4d4b11c17711961436a0f963ea0","parentHash":"0x7abfd11e862ccde76d6ea8ee20978aac26f4bcb55de1188cc0335be13e817017","timestamp":"0x55ba4564"}
+    .assert_json_stdout(str![[r#"
+{"number":"0x123","hash":"0xc5dab4e189004a1312e9db43a40abb2de91ad7dd25e75880bf36016d8e9df524","transactions":[],"logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","extraData":"0x476574682f4c5649562f76312e302e302f6c696e75782f676f312e342e32","nonce":"0x29d6547c196e00e0","miner":"0xbb7b8287f3f0a933474a79eae42cbca977791171","difficulty":"0x494433b31","gasLimit":"0x1388","gasUsed":"0x0","uncles":[],"sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","size":"0x220","transactionsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","stateRoot":"0x3fe6bd17aa85376c7d566df97d9f2e536f37f7a87abb3a6f9e2891cf9442f2e4","mixHash":"0x943056aa305aa6d22a3c06110942980342d1f4d4b11c17711961436a0f963ea0","parentHash":"0x7abfd11e862ccde76d6ea8ee20978aac26f4bcb55de1188cc0335be13e817017","timestamp":"0x55ba4564"}
 
 "#]]);
 });
@@ -677,9 +848,8 @@ casttest!(rpc_raw_params_stdin, |_prj, cmd| {
             stdin.write_all(b"\n[\n\"0x123\",\nfalse\n]\n").unwrap();
         },
     )
-    .assert_success()
-    .stdout_eq(str![[r#"
-{"number":"0x123","hash":"0xc5dab4e189004a1312e9db43a40abb2de91ad7dd25e75880bf36016d8e9df524","transactions":[],"totalDifficulty":"0x4dea420908b","logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","extraData":"0x476574682f4c5649562f76312e302e302f6c696e75782f676f312e342e32","nonce":"0x29d6547c196e00e0","miner":"0xbb7b8287f3f0a933474a79eae42cbca977791171","difficulty":"0x494433b31","gasLimit":"0x1388","gasUsed":"0x0","uncles":[],"sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","size":"0x220","transactionsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","stateRoot":"0x3fe6bd17aa85376c7d566df97d9f2e536f37f7a87abb3a6f9e2891cf9442f2e4","mixHash":"0x943056aa305aa6d22a3c06110942980342d1f4d4b11c17711961436a0f963ea0","parentHash":"0x7abfd11e862ccde76d6ea8ee20978aac26f4bcb55de1188cc0335be13e817017","timestamp":"0x55ba4564"}
+    .assert_json_stdout(str![[r#"
+{"number":"0x123","hash":"0xc5dab4e189004a1312e9db43a40abb2de91ad7dd25e75880bf36016d8e9df524","transactions":[],"logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","extraData":"0x476574682f4c5649562f76312e302e302f6c696e75782f676f312e342e32","nonce":"0x29d6547c196e00e0","miner":"0xbb7b8287f3f0a933474a79eae42cbca977791171","difficulty":"0x494433b31","gasLimit":"0x1388","gasUsed":"0x0","uncles":[],"sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","size":"0x220","transactionsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","stateRoot":"0x3fe6bd17aa85376c7d566df97d9f2e536f37f7a87abb3a6f9e2891cf9442f2e4","mixHash":"0x943056aa305aa6d22a3c06110942980342d1f4d4b11c17711961436a0f963ea0","parentHash":"0x7abfd11e862ccde76d6ea8ee20978aac26f4bcb55de1188cc0335be13e817017","timestamp":"0x55ba4564"}
 
 "#]]);
 });
@@ -694,7 +864,7 @@ casttest!(calldata_array, |_prj, cmd| {
 
 // <https://github.com/foundry-rs/foundry/issues/2705>
 casttest!(run_succeeds, |_prj, cmd| {
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
     cmd.args([
         "run",
         "-v",
@@ -742,7 +912,7 @@ casttest!(to_base, |_prj, cmd| {
 
 // tests that revert reason is only present if transaction has reverted.
 casttest!(receipt_revert_reason, |_prj, cmd| {
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
 
     // <https://etherscan.io/tx/0x44f2aaa351460c074f2cb1e5a9e28cbc7d83f33e425101d2de14331c7b7ec31e>
     cmd.args([
@@ -754,28 +924,27 @@ casttest!(receipt_revert_reason, |_prj, cmd| {
     .assert_success()
     .stdout_eq(str![[r#"
 
-blockHash               0x2cfe65be49863676b6dbc04d58176a14f39b123f1e2f4fea0383a2d82c2c50d0
-blockNumber             16239315
-contractAddress         
-cumulativeGasUsed       10743428
-effectiveGasPrice       10539984136
-from                    0x199D5ED7F45F4eE35960cF22EAde2076e95B253F
-gasUsed                 21000
-logs                    []
-logsBloom               0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-root                    
-status                  1 (success)
-transactionHash         0x44f2aaa351460c074f2cb1e5a9e28cbc7d83f33e425101d2de14331c7b7ec31e
-transactionIndex        116
-type                    0
-blobGasPrice            
-blobGasUsed             
-authorizationList       
-to                      0x91da5bf3F8Eb72724E6f50Ec6C3D199C6355c59c
+blockHash            0x2cfe65be49863676b6dbc04d58176a14f39b123f1e2f4fea0383a2d82c2c50d0
+blockNumber          16239315
+contractAddress      
+cumulativeGasUsed    10743428
+effectiveGasPrice    10539984136
+from                 0x199D5ED7F45F4eE35960cF22EAde2076e95B253F
+gasUsed              21000
+logs                 []
+logsBloom            0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+root                 
+status               1 (success)
+transactionHash      0x44f2aaa351460c074f2cb1e5a9e28cbc7d83f33e425101d2de14331c7b7ec31e
+transactionIndex     116
+type                 0
+blobGasPrice         
+blobGasUsed          
+to                   0x91da5bf3F8Eb72724E6f50Ec6C3D199C6355c59c
 
 "#]]);
 
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
 
     // <https://etherscan.io/tx/0x0e07d8b53ed3d91314c80e53cf25bcde02084939395845cbb625b029d568135c>
     cmd.cast_fuse()
@@ -788,25 +957,59 @@ to                      0x91da5bf3F8Eb72724E6f50Ec6C3D199C6355c59c
         .assert_success()
         .stdout_eq(str![[r#"
 
-blockHash               0x883f974b17ca7b28cb970798d1c80f4d4bb427473dc6d39b2a7fe24edc02902d
-blockNumber             14839405
-contractAddress         
-cumulativeGasUsed       20273649
-effectiveGasPrice       21491736378
-from                    0x3cF412d970474804623bb4e3a42dE13F9bCa5436
-gasUsed                 24952
-logs                    []
-logsBloom               0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-root                    
-status                  0 (failed)
-transactionHash         0x0e07d8b53ed3d91314c80e53cf25bcde02084939395845cbb625b029d568135c
-transactionIndex        173
-type                    2
-blobGasPrice            
-blobGasUsed             
-authorizationList       
-to                      0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
-revertReason            Transaction too old, data: "0x08c379a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000135472616e73616374696f6e20746f6f206f6c6400000000000000000000000000"
+blockHash            0x883f974b17ca7b28cb970798d1c80f4d4bb427473dc6d39b2a7fe24edc02902d
+blockNumber          14839405
+contractAddress      
+cumulativeGasUsed    20273649
+effectiveGasPrice    21491736378
+from                 0x3cF412d970474804623bb4e3a42dE13F9bCa5436
+gasUsed              24952
+logs                 []
+logsBloom            0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+root                 
+status               0 (failed)
+transactionHash      0x0e07d8b53ed3d91314c80e53cf25bcde02084939395845cbb625b029d568135c
+transactionIndex     173
+type                 2
+blobGasPrice         
+blobGasUsed          
+to                   0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
+revertReason         [..]Transaction too old, data: "0x08c379a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000135472616e73616374696f6e20746f6f206f6c6400000000000000000000000000"
+
+"#]]);
+});
+
+// tests that the revert reason is loaded using the correct `from` address.
+casttest!(revert_reason_from, |_prj, cmd| {
+    let rpc = next_rpc_endpoint(NamedChain::Sepolia);
+    // https://sepolia.etherscan.io/tx/0x10ee70cf9f5ced5c515e8d53bfab5ea9f5c72cd61b25fba455c8355ee286c4e4
+    cmd.args([
+        "receipt",
+        "0x10ee70cf9f5ced5c515e8d53bfab5ea9f5c72cd61b25fba455c8355ee286c4e4",
+        "--rpc-url",
+        rpc.as_str(),
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+
+blockHash            0x32663d7730c9ea8e1de6d99854483e25fcc05bb56c91c0cc82f9f04944fbffc1
+blockNumber          7823353
+contractAddress      
+cumulativeGasUsed    7500797
+effectiveGasPrice    14296851013
+from                 0x3583fF95f96b356d716881C871aF7Eb55ea34a93
+gasUsed              25815
+logs                 []
+logsBloom            0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+root                 
+status               0 (failed)
+transactionHash      0x10ee70cf9f5ced5c515e8d53bfab5ea9f5c72cd61b25fba455c8355ee286c4e4
+transactionIndex     96
+type                 0
+blobGasPrice         
+blobGasUsed          
+to                   0x91b5d4111a4C038153b24e31F75ccdC47123595d
+revertReason         Counter is too large, data: "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000014436f756e74657220697320746f6f206c61726765000000000000000000000000"
 
 "#]]);
 });
@@ -854,7 +1057,7 @@ access list:
 });
 
 casttest!(logs_topics, |_prj, cmd| {
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
     cmd.args([
         "logs",
         "--rpc-url",
@@ -871,7 +1074,7 @@ casttest!(logs_topics, |_prj, cmd| {
 });
 
 casttest!(logs_topic_2, |_prj, cmd| {
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
     cmd.args([
         "logs",
         "--rpc-url",
@@ -890,7 +1093,7 @@ casttest!(logs_topic_2, |_prj, cmd| {
 });
 
 casttest!(logs_sig, |_prj, cmd| {
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
     cmd.args([
         "logs",
         "--rpc-url",
@@ -907,7 +1110,7 @@ casttest!(logs_sig, |_prj, cmd| {
 });
 
 casttest!(logs_sig_2, |_prj, cmd| {
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
     cmd.args([
         "logs",
         "--rpc-url",
@@ -1007,6 +1210,32 @@ casttest!(mktx_signer_from_match, |_prj, cmd| {
 "#]]);
 });
 
+casttest!(mktx_raw_unsigned, |_prj, cmd| {
+    cmd.args([
+        "mktx",
+        "--from",
+        "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+        "--chain",
+        "1",
+        "--nonce",
+        "0",
+        "--gas-limit",
+        "21000",
+        "--gas-price",
+        "10000000000",
+        "--priority-gas-price",
+        "1000000000",
+        "0x0000000000000000000000000000000000000001",
+        "--raw-unsigned",
+    ])
+    .assert_success()
+    .stdout_eq(str![[
+        r#"0x02e80180843b9aca008502540be4008252089400000000000000000000000000000000000000018080c0
+
+"#
+    ]]);
+});
+
 // tests that the raw encoded transaction is returned
 casttest!(tx_raw, |_prj, cmd| {
     let rpc = next_http_rpc_endpoint();
@@ -1052,7 +1281,7 @@ Error: Must specify a recipient address or contract code to deploy
 });
 
 casttest!(storage, |_prj, cmd| {
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
     cmd.args(["storage", "vitalik.eth", "1", "--rpc-url", &rpc]).assert_success().stdout_eq(str![
         [r#"
 0x0000000000000000000000000000000000000000000000000000000000000000
@@ -1060,7 +1289,7 @@ casttest!(storage, |_prj, cmd| {
 "#]
     ]);
 
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
     cmd.cast_fuse()
         .args(["storage", "vitalik.eth", "0x01", "--rpc-url", &rpc])
         .assert_success()
@@ -1069,7 +1298,7 @@ casttest!(storage, |_prj, cmd| {
 
 "#]]);
 
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
     let usdt = "0xdac17f958d2ee523a2206206994597c13d831ec7";
     let decimals_slot = "0x09";
     cmd.cast_fuse()
@@ -1080,7 +1309,7 @@ casttest!(storage, |_prj, cmd| {
 
 "#]]);
 
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
     let total_supply_slot = "0x01";
     let block_before = "4634747";
     let block_after = "4634748";
@@ -1092,7 +1321,7 @@ casttest!(storage, |_prj, cmd| {
 
 "#]]);
 
-    let rpc = next_http_rpc_endpoint();
+    let rpc = next_http_archive_rpc_url();
     cmd.cast_fuse()
         .args(["storage", usdt, total_supply_slot, "--rpc-url", &rpc, "--block", block_after])
         .assert_success()
@@ -1107,7 +1336,7 @@ casttest!(storage_layout_simple, |_prj, cmd| {
     cmd.args([
         "storage",
         "--rpc-url",
-        next_rpc_endpoint(NamedChain::Mainnet).as_str(),
+        next_http_archive_rpc_url().as_str(),
         "--block",
         "21034138",
         "--etherscan-api-key",
@@ -1116,12 +1345,34 @@ casttest!(storage_layout_simple, |_prj, cmd| {
     ])
     .assert_success()
     .stdout_eq(str![[r#"
+
+╭---------+---------+------+--------+-------+-------+--------------------------------------------------------------------+-----------------------------------------------╮
 | Name    | Type    | Slot | Offset | Bytes | Value | Hex Value                                                          | Contract                                      |
-|---------|---------|------|--------|-------|-------|--------------------------------------------------------------------|-----------------------------------------------|
++========================================================================================================================================================================+
 | _owner  | address | 0    | 0      | 20    | 0     | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/Create2Deployer.sol:Create2Deployer |
+|---------+---------+------+--------+-------+-------+--------------------------------------------------------------------+-----------------------------------------------|
 | _paused | bool    | 0    | 20     | 1     | 0     | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/Create2Deployer.sol:Create2Deployer |
+╰---------+---------+------+--------+-------+-------+--------------------------------------------------------------------+-----------------------------------------------╯
+
 
 "#]]);
+});
+
+// <https://github.com/foundry-rs/foundry/pull/9332>
+casttest!(storage_layout_simple_json, |_prj, cmd| {
+    cmd.args([
+        "storage",
+        "--rpc-url",
+        next_http_archive_rpc_url().as_str(),
+        "--block",
+        "21034138",
+        "--etherscan-api-key",
+        next_mainnet_etherscan_api_key().as_str(),
+        "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
+        "--json",
+    ])
+    .assert_success()
+    .stdout_eq(file!["../fixtures/storage_layout_simple.json": Json]);
 });
 
 // <https://github.com/foundry-rs/foundry/issues/6319>
@@ -1129,7 +1380,7 @@ casttest!(storage_layout_complex, |_prj, cmd| {
     cmd.args([
         "storage",
         "--rpc-url",
-        next_rpc_endpoint(NamedChain::Mainnet).as_str(),
+        next_http_archive_rpc_url().as_str(),
         "--block",
         "21034138",
         "--etherscan-api-key",
@@ -1138,23 +1389,97 @@ casttest!(storage_layout_complex, |_prj, cmd| {
     ])
     .assert_success()
     .stdout_eq(str![[r#"
+
+╭-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------╮
 | Name                          | Type                                                               | Slot | Offset | Bytes | Value                                            | Hex Value                                                          | Contract                        |
-|-------------------------------|--------------------------------------------------------------------|------|--------|-------|--------------------------------------------------|--------------------------------------------------------------------|---------------------------------|
++======================================================================================================================================================================================================================================================================================+
 | _status                       | uint256                                                            | 0    | 0      | 32    | 1                                                | 0x0000000000000000000000000000000000000000000000000000000000000001 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _generalPoolsBalances         | mapping(bytes32 => struct EnumerableMap.IERC20ToBytes32Map)        | 1    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _nextNonce                    | mapping(address => uint256)                                        | 2    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _paused                       | bool                                                               | 3    | 0      | 1     | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _authorizer                   | contract IAuthorizer                                               | 3    | 1      | 20    | 549683469959765988649777481110995959958745616871 | 0x0000000000000000000000006048a8c631fb7e77eca533cf9c29784e482391e7 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _approvedRelayers             | mapping(address => mapping(address => bool))                       | 4    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _isPoolRegistered             | mapping(bytes32 => bool)                                           | 5    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _nextPoolNonce                | uint256                                                            | 6    | 0      | 32    | 1760                                             | 0x00000000000000000000000000000000000000000000000000000000000006e0 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _minimalSwapInfoPoolsBalances | mapping(bytes32 => mapping(contract IERC20 => bytes32))            | 7    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _minimalSwapInfoPoolsTokens   | mapping(bytes32 => struct EnumerableSet.AddressSet)                | 8    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _twoTokenPoolTokens           | mapping(bytes32 => struct TwoTokenPoolsBalance.TwoTokenPoolTokens) | 9    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _poolAssetManagers            | mapping(bytes32 => mapping(contract IERC20 => address))            | 10   | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/vault/Vault.sol:Vault |
+|-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------|
 | _internalTokenBalance         | mapping(address => mapping(contract IERC20 => uint256))            | 11   | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/vault/Vault.sol:Vault |
+╰-------------------------------+--------------------------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+---------------------------------╯
+
 
 "#]]);
+});
+
+casttest!(storage_layout_complex_proxy, |_prj, cmd| {
+    cmd.args([
+        "storage",
+        "--rpc-url",
+        next_rpc_endpoint(NamedChain::Sepolia).as_str(),
+        "--block",
+        "7857852",
+        "--etherscan-api-key",
+        next_mainnet_etherscan_api_key().as_str(),
+        "0xE2588A9CAb7Ea877206E35f615a39f84a64A7A3b",
+        "--proxy",
+        "0x29fcb43b46531bca003ddc8fcb67ffe91900c762"
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+
+╭----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------╮
+| Name                       | Type                                            | Slot | Offset | Bytes | Value                                            | Hex Value                                                          | Contract                    |
++============================================================================================================================================================================================================================================================+
+| singleton                  | address                                         | 0    | 0      | 20    | 239704109775411986678417050956533140837380441954 | 0x00000000000000000000000029fcb43b46531bca003ddc8fcb67ffe91900c762 | contracts/SafeL2.sol:SafeL2 |
+|----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------|
+| modules                    | mapping(address => address)                     | 1    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/SafeL2.sol:SafeL2 |
+|----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------|
+| owners                     | mapping(address => address)                     | 2    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/SafeL2.sol:SafeL2 |
+|----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------|
+| ownerCount                 | uint256                                         | 3    | 0      | 32    | 1                                                | 0x0000000000000000000000000000000000000000000000000000000000000001 | contracts/SafeL2.sol:SafeL2 |
+|----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------|
+| threshold                  | uint256                                         | 4    | 0      | 32    | 1                                                | 0x0000000000000000000000000000000000000000000000000000000000000001 | contracts/SafeL2.sol:SafeL2 |
+|----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------|
+| nonce                      | uint256                                         | 5    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/SafeL2.sol:SafeL2 |
+|----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------|
+| _deprecatedDomainSeparator | bytes32                                         | 6    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/SafeL2.sol:SafeL2 |
+|----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------|
+| signedMessages             | mapping(bytes32 => uint256)                     | 7    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/SafeL2.sol:SafeL2 |
+|----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------|
+| approvedHashes             | mapping(address => mapping(bytes32 => uint256)) | 8    | 0      | 32    | 0                                                | 0x0000000000000000000000000000000000000000000000000000000000000000 | contracts/SafeL2.sol:SafeL2 |
+╰----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------╯
+
+
+"#]]);
+});
+
+casttest!(storage_layout_complex_json, |_prj, cmd| {
+    cmd.args([
+        "storage",
+        "--rpc-url",
+        next_http_archive_rpc_url().as_str(),
+        "--block",
+        "21034138",
+        "--etherscan-api-key",
+        next_mainnet_etherscan_api_key().as_str(),
+        "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
+        "--json",
+    ])
+    .assert_success()
+    .stdout_eq(file!["../fixtures/storage_layout_complex.json": Json]);
 });
 
 casttest!(balance, |_prj, cmd| {
@@ -1364,6 +1689,70 @@ casttest!(block_number_hash, |_prj, cmd| {
     assert_eq!(s.trim().parse::<u64>().unwrap(), 1, "{s}")
 });
 
+// Tests that `cast --disable-block-gas-limit` commands are working correctly for BSC
+// <https://github.com/foundry-rs/foundry/pull/9996>
+// Equivalent transaction on Binance Smart Chain Testnet:
+// <https://testnet.bscscan.com/tx/0x0db4f279fc4d47dca1e6ace180f45f50c5bf12e2b968f210c217f57031e02744>
+casttest!(run_disable_block_gas_limit_check, |_prj, cmd| {
+    let bsc_testnet_rpc_url = next_rpc_endpoint(NamedChain::BinanceSmartChainTestnet);
+
+    let latest_block_json: serde_json::Value = serde_json::from_str(
+        &cmd.args(["block", "--rpc-url", bsc_testnet_rpc_url.as_str(), "--json"])
+            .assert_success()
+            .get_output()
+            .stdout_lossy(),
+    )
+    .expect("Failed to parse latest block");
+
+    let latest_excessive_gas_limit_tx =
+        latest_block_json["transactions"].as_array().and_then(|txs| {
+            txs.iter()
+                .find(|tx| tx.get("gas").and_then(|gas| gas.as_str()) == Some("0x7fffffffffffffff"))
+        });
+
+    match latest_excessive_gas_limit_tx {
+        Some(tx) => {
+            let tx_hash =
+                tx.get("hash").and_then(|h| h.as_str()).expect("Transaction missing hash");
+
+            // If --disable-block-gas-limit is not provided, the transaction should fail as the gas
+            // limit exceeds the block gas limit.
+            cmd.cast_fuse()
+                .args(["run", "-v", tx_hash, "--quick", "--rpc-url", bsc_testnet_rpc_url.as_str()])
+                .assert_failure()
+                .stderr_eq(str![[r#"
+Error: EVM error; transaction validation error: caller gas limit exceeds the block gas limit
+
+"#]]);
+
+            // If --disable-block-gas-limit is provided, the transaction should succeed
+            // despite the gas limit exceeding the block gas limit.
+            cmd.cast_fuse()
+                .args([
+                    "run",
+                    "-v",
+                    tx_hash,
+                    "--quick",
+                    "--rpc-url",
+                    bsc_testnet_rpc_url.as_str(),
+                    "--disable-block-gas-limit",
+                ])
+                .assert_success()
+                .stdout_eq(str![[r#"
+...
+Transaction successfully executed.
+[GAS]
+
+"#]]);
+        }
+        None => {
+            eprintln!(
+                "Skipping test: No transaction with gas = 0x7fffffffffffffff found in the latest block."
+            );
+        }
+    }
+});
+
 casttest!(send_eip7702, async |_prj, cmd| {
     let (_api, handle) =
         anvil::spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::PragueEOF.into())))
@@ -1500,6 +1889,479 @@ casttest!(fetch_constructor_args_from_etherscan, |_prj, cmd| {
     .assert_success()
     .stdout_eq(str![[r#"
 0x00000000000000000000000000000000000014bddab3e51a57cff87a50000000 → Uint(420690000000000000000000000000000, 256)
+
+"#]]);
+});
+
+// <https://github.com/foundry-rs/foundry/issues/3473>
+casttest!(test_non_mainnet_traces, |prj, cmd| {
+    prj.clear();
+    cmd.args([
+        "run",
+        "0xa003e419e2d7502269eb5eda56947b580120e00abfd5b5460d08f8af44a0c24f",
+        "--rpc-url",
+        next_rpc_endpoint(NamedChain::Optimism).as_str(),
+        "--etherscan-api-key",
+        next_etherscan_api_key(NamedChain::Optimism).as_str(),
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+Executing previous transactions from the block.
+Traces:
+  [33841] FiatTokenProxy::fallback(0x111111125421cA6dc452d289314280a0f8842A65, 164054805 [1.64e8])
+    ├─ [26673] FiatTokenV2_2::approve(0x111111125421cA6dc452d289314280a0f8842A65, 164054805 [1.64e8]) [delegatecall]
+    │   ├─ emit Approval(owner: 0x9a95Af47C51562acfb2107F44d7967DF253197df, spender: 0x111111125421cA6dc452d289314280a0f8842A65, value: 164054805 [1.64e8])
+    │   └─ ← [Return] true
+    └─ ← [Return] true
+...
+
+"#]]);
+});
+
+// tests that displays a sample contract artifact
+// <https://etherscan.io/address/0x0923cad07f06b2d0e5e49e63b8b35738d4156b95>
+casttest!(fetch_artifact_from_etherscan, |_prj, cmd| {
+    let eth_rpc_url = next_http_rpc_endpoint();
+    cmd.args([
+        "artifact",
+        "--etherscan-api-key",
+        &next_mainnet_etherscan_api_key(),
+        "0x0923cad07f06b2d0e5e49e63b8b35738d4156b95",
+        "--rpc-url",
+        eth_rpc_url.as_str(),
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"{
+  "abi": [],
+  "bytecode": {
+    "object": "0x60566050600b82828239805160001a6073146043577f4e487b7100000000000000000000000000000000000000000000000000000000600052600060045260246000fd5b30600052607381538281f3fe73000000000000000000000000000000000000000030146080604052600080fdfea264697066735822122074c61e8e4eefd410ca92eec26e8112ec6e831d0a4bf35718fdd78b45d68220d064736f6c63430008070033"
+  }
+}
+
+"#]]);
+});
+
+// tests cast can decode traces when using project artifacts
+forgetest_async!(decode_traces_with_project_artifacts, |prj, cmd| {
+    let (api, handle) =
+        anvil::spawn(NodeConfig::test().with_disable_default_create2_deployer(true)).await;
+
+    foundry_test_utils::util::initialize(prj.root());
+    prj.add_source(
+        "LocalProjectContract",
+        r#"
+contract LocalProjectContract {
+    event LocalProjectContractCreated(address owner);
+
+    constructor() {
+        emit LocalProjectContractCreated(msg.sender);
+    }
+}
+   "#,
+    )
+    .unwrap();
+    prj.add_script(
+        "LocalProjectScript",
+        r#"
+import "forge-std/Script.sol";
+import {LocalProjectContract} from "../src/LocalProjectContract.sol";
+
+contract LocalProjectScript is Script {
+    function run() public {
+        vm.startBroadcast();
+        new LocalProjectContract();
+        vm.stopBroadcast();
+    }
+}
+   "#,
+    )
+    .unwrap();
+
+    cmd.args([
+        "script",
+        "--private-key",
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        "--rpc-url",
+        &handle.http_endpoint(),
+        "--broadcast",
+        "LocalProjectScript",
+    ]);
+
+    cmd.assert_success();
+
+    let tx_hash = api
+        .transaction_by_block_number_and_index(BlockNumberOrTag::Latest, Index::from(0))
+        .await
+        .unwrap()
+        .unwrap()
+        .tx_hash();
+
+    // Assert cast with local artifacts from outside the project.
+    cmd.cast_fuse()
+        .args(["run", "--la", format!("{tx_hash}").as_str(), "--rpc-url", &handle.http_endpoint()])
+        .assert_success()
+        .stdout_eq(str![[r#"
+Executing previous transactions from the block.
+Compiling project to generate artifacts
+Nothing to compile
+
+"#]]);
+
+    // Run cast from project dir.
+    cmd.cast_fuse().set_current_dir(prj.root());
+
+    // Assert cast without local artifacts cannot decode traces.
+    cmd.cast_fuse()
+        .args(["run", format!("{tx_hash}").as_str(), "--rpc-url", &handle.http_endpoint()])
+        .assert_success()
+        .stdout_eq(str![[r#"
+Executing previous transactions from the block.
+Traces:
+  [..] → new <unknown>@0x5FbDB2315678afecb367f032d93F642f64180aa3
+    ├─  emit topic 0: 0xa7263295d3a687d750d1fd377b5df47de69d7db8decc745aaa4bbee44dc1688d
+    │           data: 0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266
+    └─ ← [Return] 62 bytes of code
+
+
+Transaction successfully executed.
+[GAS]
+
+"#]]);
+
+    // Assert cast with local artifacts can decode traces.
+    cmd.cast_fuse()
+        .args(["run", "--la", format!("{tx_hash}").as_str(), "--rpc-url", &handle.http_endpoint()])
+        .assert_success()
+        .stdout_eq(str![[r#"
+Executing previous transactions from the block.
+Compiling project to generate artifacts
+No files changed, compilation skipped
+Traces:
+  [..] → new LocalProjectContract@0x5FbDB2315678afecb367f032d93F642f64180aa3
+    ├─ emit LocalProjectContractCreated(owner: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266)
+    └─ ← [Return] 62 bytes of code
+
+
+Transaction successfully executed.
+[GAS]
+
+"#]]);
+});
+
+// tests cast can decode traces when running with verbosity level > 4
+forgetest_async!(show_state_changes_in_traces, |prj, cmd| {
+    let (api, handle) = anvil::spawn(NodeConfig::test()).await;
+
+    foundry_test_utils::util::initialize(prj.root());
+    // Deploy counter contract.
+    cmd.args([
+        "script",
+        "--private-key",
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        "--rpc-url",
+        &handle.http_endpoint(),
+        "--broadcast",
+        "CounterScript",
+    ])
+    .assert_success();
+
+    // Send tx to change counter storage value.
+    cmd.cast_fuse()
+        .args([
+            "send",
+            "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            "setNumber(uint256)",
+            "111",
+            "--private-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            "--rpc-url",
+            &handle.http_endpoint(),
+        ])
+        .assert_success();
+
+    let tx_hash = api
+        .transaction_by_block_number_and_index(BlockNumberOrTag::Latest, Index::from(0))
+        .await
+        .unwrap()
+        .unwrap()
+        .tx_hash();
+
+    // Assert cast with verbosity displays storage changes.
+    cmd.cast_fuse()
+        .args([
+            "run",
+            format!("{tx_hash}").as_str(),
+            "-vvvvv",
+            "--rpc-url",
+            &handle.http_endpoint(),
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+Executing previous transactions from the block.
+Traces:
+  [..] 0x5FbDB2315678afecb367f032d93F642f64180aa3::setNumber(111)
+    ├─  storage changes:
+    │   @ 0: 0 → 111
+    └─ ← [Stop]
+
+
+Transaction successfully executed.
+[GAS]
+
+"#]]);
+});
+
+// tests cast can decode external libraries traces with project cached selectors
+forgetest_async!(decode_external_libraries_with_cached_selectors, |prj, cmd| {
+    let (api, handle) = anvil::spawn(NodeConfig::test()).await;
+
+    foundry_test_utils::util::initialize(prj.root());
+    prj.add_source(
+        "ExternalLib",
+        r#"
+import "./CounterInExternalLib.sol";
+library ExternalLib {
+    function updateCounterInExternalLib(CounterInExternalLib.Info storage counterInfo, uint256 counter) public {
+        counterInfo.counter = counter + 1;
+    }
+}
+   "#,
+    )
+    .unwrap();
+    prj.add_source(
+        "CounterInExternalLib",
+        r#"
+import "./ExternalLib.sol";
+contract CounterInExternalLib {
+    struct Info {
+        uint256 counter;
+    }
+    Info info;
+    constructor() {
+        ExternalLib.updateCounterInExternalLib(info, 100);
+    }
+}
+   "#,
+    )
+    .unwrap();
+    prj.add_script(
+        "CounterInExternalLibScript",
+        r#"
+import "forge-std/Script.sol";
+import {CounterInExternalLib} from "../src/CounterInExternalLib.sol";
+contract CounterInExternalLibScript is Script {
+    function run() public {
+        vm.startBroadcast();
+        new CounterInExternalLib();
+        vm.stopBroadcast();
+    }
+}
+   "#,
+    )
+    .unwrap();
+
+    cmd.args([
+        "script",
+        "--private-key",
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        "--rpc-url",
+        &handle.http_endpoint(),
+        "--broadcast",
+        "CounterInExternalLibScript",
+    ])
+    .assert_success();
+
+    let tx_hash = api
+        .transaction_by_block_number_and_index(BlockNumberOrTag::Latest, Index::from(0))
+        .await
+        .unwrap()
+        .unwrap()
+        .tx_hash();
+
+    // Cache project selectors.
+    cmd.forge_fuse().set_current_dir(prj.root());
+    cmd.forge_fuse().args(["selectors", "cache"]).assert_success();
+
+    // Assert cast with local artifacts can decode external lib signature.
+    cmd.cast_fuse().set_current_dir(prj.root());
+    cmd.cast_fuse()
+        .args(["run", format!("{tx_hash}").as_str(), "--rpc-url", &handle.http_endpoint()])
+        .assert_success()
+        .stdout_eq(str![[r#"
+...
+Traces:
+  [..] → new <unknown>@0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
+    ├─ [..] 0x52F3e85EC3F0f9D0a2200D646482fcD134D5adc9::updateCounterInExternalLib(0, 100) [delegatecall]
+    │   └─ ← [Stop]
+    └─ ← [Return] 62 bytes of code
+
+
+Transaction successfully executed.
+[GAS]
+
+"#]]);
+});
+
+// https://github.com/foundry-rs/foundry/issues/9476
+forgetest_async!(cast_call_custom_chain_id, |_prj, cmd| {
+    let chain_id = 55555u64;
+    let (_api, handle) = anvil::spawn(NodeConfig::test().with_chain_id(Some(chain_id))).await;
+
+    let http_endpoint = handle.http_endpoint();
+
+    cmd.cast_fuse()
+        .args([
+            "call",
+            "5FbDB2315678afecb367f032d93F642f64180aa3",
+            "--rpc-url",
+            &http_endpoint,
+            "--chain",
+            &chain_id.to_string(),
+        ])
+        .assert_success();
+});
+
+// https://github.com/foundry-rs/foundry/issues/9541
+forgetest_async!(cast_run_impersonated_tx, |_prj, cmd| {
+    let (_api, handle) = anvil::spawn(
+        NodeConfig::test()
+            .with_auto_impersonate(true)
+            .with_eth_rpc_url(Some("https://sepolia.base.org")),
+    )
+    .await;
+
+    let http_endpoint = handle.http_endpoint();
+
+    let provider = ProviderBuilder::new().on_http(http_endpoint.parse().unwrap());
+
+    // send impersonated tx
+    let tx = TransactionRequest::default()
+        .with_from(address!("0x041563c07028Fc89106788185763Fc73028e8511"))
+        .with_to(address!("0xF38aA5909D89F5d98fCeA857e708F6a6033f6CF8"))
+        .with_input(
+            Bytes::from_str(
+                "0x60fe47b1000000000000000000000000000000000000000000000000000000000000000c",
+            )
+            .unwrap(),
+        );
+
+    let receipt = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
+
+    assert!(receipt.status());
+
+    // run impersonated tx
+    cmd.cast_fuse()
+        .args(["run", &receipt.transaction_hash.to_string(), "--rpc-url", &http_endpoint])
+        .assert_success();
+});
+
+// <https://github.com/foundry-rs/foundry/issues/4776>
+casttest!(fetch_src_blockscout, |_prj, cmd| {
+    let url = "https://eth.blockscout.com/api";
+
+    let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+
+    cmd.args([
+        "source",
+        &weth.to_string(),
+        "--chain-id",
+        "1",
+        "--explorer-api-url",
+        url,
+        "--flatten",
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+...
+contract WETH9 {
+    string public name     = "Wrapped Ether";
+    string public symbol   = "WETH";
+    uint8  public decimals = 18;
+..."#]]);
+});
+
+casttest!(fetch_src_default, |_prj, cmd| {
+    let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let etherscan_api_key = next_mainnet_etherscan_api_key();
+
+    cmd.args(["source", &weth.to_string(), "--flatten", "--etherscan-api-key", &etherscan_api_key])
+        .assert_success()
+        .stdout_eq(str![[r#"
+...
+contract WETH9 {
+    string public name     = "Wrapped Ether";
+    string public symbol   = "WETH";
+    uint8  public decimals = 18;
+..."#]]);
+});
+
+// tests cast send gas estimate execution failure message contains decoded custom error
+// <https://github.com/foundry-rs/foundry/issues/9789>
+forgetest_async!(cast_send_estimate_gas_error, |prj, cmd| {
+    let (_, handle) = anvil::spawn(NodeConfig::test()).await;
+
+    foundry_test_utils::util::initialize(prj.root());
+    prj.add_source(
+        "SimpleStorage",
+        r#"
+contract SimpleStorage {
+    uint256 private storedValue;
+    error AddressInsufficientBalance(address account, uint256 newValue);
+    function setValue(uint256 _newValue) public {
+        if (_newValue > 100) {
+            revert AddressInsufficientBalance(msg.sender, _newValue);
+        }
+        storedValue = _newValue;
+    }
+}
+   "#,
+    )
+    .unwrap();
+    prj.add_script(
+        "SimpleStorageScript",
+        r#"
+import "forge-std/Script.sol";
+import {SimpleStorage} from "../src/SimpleStorage.sol";
+contract SimpleStorageScript is Script {
+    function run() public {
+        vm.startBroadcast();
+        new SimpleStorage();
+        vm.stopBroadcast();
+    }
+}
+   "#,
+    )
+    .unwrap();
+
+    cmd.args([
+        "script",
+        "--private-key",
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        "--rpc-url",
+        &handle.http_endpoint(),
+        "--broadcast",
+        "SimpleStorageScript",
+    ])
+    .assert_success();
+
+    // Cache project selectors.
+    cmd.forge_fuse().set_current_dir(prj.root());
+    cmd.forge_fuse().args(["selectors", "cache"]).assert_success();
+
+    // Assert cast send can decode custom error on estimate gas execution failure.
+    cmd.cast_fuse()
+        .args([
+            "send",
+            "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            "setValue(uint256)",
+            "1000",
+            "--private-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            "--rpc-url",
+            &handle.http_endpoint(),
+        ])
+        .assert_failure().stderr_eq(str![[r#"
+Error: Failed to estimate gas: server returned an error response: error code 3: execution reverted: custom error 0x6786ad34: 000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb9226600000000000000000000000000000000000000000000000000000000000003e8, data: "0x6786ad34000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb9226600000000000000000000000000000000000000000000000000000000000003e8": AddressInsufficientBalance(0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266, 1000)
 
 "#]]);
 });

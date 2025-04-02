@@ -50,7 +50,7 @@ impl FormatterError {
     }
 }
 
-#[allow(unused_macros)]
+#[expect(unused_macros)]
 macro_rules! format_err {
     ($msg:literal $(,)?) => {
         $crate::formatter::FormatterError::custom($msg.to_string())
@@ -63,7 +63,6 @@ macro_rules! format_err {
     };
 }
 
-#[allow(unused_macros)]
 macro_rules! bail {
     ($msg:literal $(,)?) => {
         return Err($crate::formatter::format_err!($msg))
@@ -88,7 +87,7 @@ struct Context {
 impl Context {
     /// Returns true if the current function context is the constructor
     pub(crate) fn is_constructor_function(&self) -> bool {
-        self.function.as_ref().map_or(false, |f| matches!(f.ty, FunctionTy::Constructor))
+        self.function.as_ref().is_some_and(|f| matches!(f.ty, FunctionTy::Constructor))
     }
 }
 
@@ -132,14 +131,13 @@ impl<'a, W: Write> Formatter<'a, W> {
     }
 
     /// Casts the current writer `w` as a `String` reference. Should only be used for debugging.
-    #[allow(dead_code)]
     unsafe fn buf_contents(&self) -> &String {
         *(&self.buf.w as *const W as *const &mut String)
     }
 
     /// Casts the current `W` writer or the current temp buffer as a `String` reference.
     /// Should only be used for debugging.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     unsafe fn temp_buf_contents(&self) -> &String {
         match &self.temp_bufs[..] {
             [] => self.buf_contents(),
@@ -341,7 +339,7 @@ impl<'a, W: Write> Formatter<'a, W> {
                     _ => stmt.loc().start(),
                 };
 
-                self.find_next_line(start_from).map_or(false, |loc| loc >= end_at)
+                self.find_next_line(start_from).is_some_and(|loc| loc >= end_at)
             }
         }
     }
@@ -560,7 +558,7 @@ impl<'a, W: Write> Formatter<'a, W> {
     fn write_doc_block_line(&mut self, comment: &CommentWithMetadata, line: &str) -> Result<()> {
         if line.trim().starts_with('*') {
             let line = line.trim().trim_start_matches('*');
-            let needs_space = line.chars().next().map_or(false, |ch| !ch.is_whitespace());
+            let needs_space = line.chars().next().is_some_and(|ch| !ch.is_whitespace());
             write!(self.buf(), " *{}", if needs_space { " " } else { "" })?;
             self.write_comment_line(comment, line)?;
             self.write_whitespace_separator(true)?;
@@ -1849,7 +1847,7 @@ impl<'a, W: Write> Formatter<'a, W> {
         }
 
         // order all groups alphabetically
-        for group in import_groups.iter() {
+        for group in &import_groups {
             // SAFETY: group is not empty
             let first = group[0];
             let last = group.last().copied().expect("group is not empty");
@@ -1945,7 +1943,7 @@ impl<W: Write> Visitor for Formatter<'_, W> {
         )?;
 
         // EOF newline
-        if self.last_char().map_or(true, |char| char != '\n') {
+        if self.last_char() != Some('\n') {
             writeln!(self.buf())?;
         }
 
@@ -2095,7 +2093,6 @@ impl<W: Write> Visitor for Formatter<'_, W> {
         let (ident, string) = (ident.safe_unwrap(), string.safe_unwrap());
         return_source_if_disabled!(self, loc, ';');
 
-        #[allow(clippy::if_same_then_else)]
         let pragma_descriptor = if ident.name == "solidity" {
             // There are some issues with parsing Solidity's versions with crates like `semver`:
             // 1. Ranges like `>=0.4.21<0.6.0` or `>=0.4.21 <0.6.0` are not parseable at all.
@@ -3259,7 +3256,7 @@ impl<W: Write> Visitor for Formatter<'_, W> {
 
                 // we can however check if the contract `is` the `base`, this however also does
                 // not cover all cases
-                let is_contract_base = self.context.contract.as_ref().map_or(false, |contract| {
+                let is_contract_base = self.context.contract.as_ref().is_some_and(|contract| {
                     contract.base.iter().any(|contract_base| {
                         contract_base
                             .name
@@ -3280,7 +3277,7 @@ impl<W: Write> Visitor for Formatter<'_, W> {
                     let mut base_or_modifier =
                         self.visit_to_chunk(loc.start(), Some(loc.end()), base)?;
                     let is_lowercase =
-                        base_or_modifier.content.chars().next().map_or(false, |c| c.is_lowercase());
+                        base_or_modifier.content.chars().next().is_some_and(|c| c.is_lowercase());
                     if is_lowercase && base_or_modifier.content.ends_with("()") {
                         base_or_modifier.content.truncate(base_or_modifier.content.len() - 2);
                     }
