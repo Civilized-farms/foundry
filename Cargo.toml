@@ -223,7 +223,7 @@ alloy-transport-ipc = { version = "0.12.1", default-features = false }
 alloy-transport-ws = { version = "0.12.1", default-features = false }
 
 ## alloy-core
-alloy-dyn-abi = "0.8.22"
+alloy-dyn-abi = "0.8.26"
 alloy-json-abi = "0.8.22"
 alloy-primitives = { version = "0.8.22", features = [
     "getrandom",
@@ -258,7 +258,7 @@ thiserror = "2"
 
 # misc
 auto_impl = "1"
-bytes = "1.8"
+bytes = "1.11"
 walkdir = "2"
 prettyplease = "0.2"
 base64 = "0.22"
@@ -285,7 +285,7 @@ mesc = "0.3"
 num-format = "0.4"
 parking_lot = "0.12"
 proptest = "1"
-rand = "0.8"
+rand = "0.9"
 rayon = "1"
 regex = { version = "1", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = [
