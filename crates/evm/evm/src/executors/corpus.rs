@@ -48,7 +48,9 @@ use foundry_evm_core::evm::FoundryEvmNetwork;
 use foundry_evm_fuzz::{
     BasicTxDetails,
     invariant::FuzzRunIdentifiedContracts,
-    strategies::{EvmFuzzState, generate_msg_value, mutate_param_value},
+    strategies::{
+        EvmFuzzState, FuzzStateReader, InvariantFuzzState, generate_msg_value, mutate_param_value,
+    },
 };
 use proptest::{
     prelude::{Just, Rng, Strategy},
@@ -367,6 +369,13 @@ impl WorkerCorpus {
             }
 
             // Master worker loads the initial corpus, if it exists.
+            if fuzzed_contracts.is_some() && has_legacy_invariant_corpus_dirs(corpus_dir) {
+                let _ = sh_warn!(
+                    "Ignoring legacy invariant corpus directories under {}; new corpus entries are persisted under the contract-level corpus directory.",
+                    corpus_dir.display(),
+                );
+            }
+
             // Then, [distribute]s it to workers.
             let executor = executor.expect("Executor required for master worker");
             'corpus_replay: for entry in read_corpus_dir(corpus_dir) {
@@ -585,7 +594,7 @@ impl WorkerCorpus {
     pub fn new_inputs(
         &mut self,
         test_runner: &mut TestRunner,
-        fuzz_state: &EvmFuzzState,
+        fuzz_state: &InvariantFuzzState,
         targeted_contracts: &FuzzRunIdentifiedContracts,
     ) -> Result<Vec<BasicTxDetails>> {
         let mut new_seq = vec![];
@@ -678,7 +687,7 @@ impl WorkerCorpus {
                     }
                 }
                 MutationType::Abi => {
-                    let targets = targeted_contracts.targets.lock();
+                    let targets = targeted_contracts.targets();
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
                     trace!(target: "corpus", "ABI mutate args of {}", corpus.uuid);
 
@@ -697,7 +706,7 @@ impl WorkerCorpus {
                     }
                 }
                 MutationType::Cmp => {
-                    let targets = targeted_contracts.targets.lock();
+                    let targets = targeted_contracts.targets();
                     let corpus = if rng.random::<bool>() { primary } else { secondary };
                     trace!(target: "corpus", "cmp mutate args of {}", corpus.uuid);
 
@@ -861,7 +870,7 @@ impl WorkerCorpus {
         tx: &mut BasicTxDetails,
         function: &Function,
         test_runner: &mut TestRunner,
-        fuzz_state: &EvmFuzzState,
+        fuzz_state: &impl FuzzStateReader,
     ) -> Result<()> {
         // Mutate value with 15% probability for payable functions.
         if function.state_mutability == alloy_json_abi::StateMutability::Payable
@@ -1284,7 +1293,7 @@ impl WorkerCorpus {
         fuzzed_function: Option<&Function>,
         fuzzed_contracts: Option<&FuzzRunIdentifiedContracts>,
     ) -> bool {
-        fuzzed_contracts.is_some_and(|contracts| contracts.targets.lock().can_replay(tx))
+        fuzzed_contracts.is_some_and(|contracts| contracts.targets().can_replay(tx))
             || fuzzed_function.is_some_and(|function| {
                 tx.call_details
                     .calldata
@@ -1331,6 +1340,17 @@ fn read_corpus_dir(path: &Path) -> impl Iterator<Item = CorpusDirEntry> {
     })
     .collect::<Vec<_>>()
     .into_iter()
+}
+
+fn has_legacy_invariant_corpus_dirs(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            path.is_dir()
+                && entry.file_name().to_str().is_some_and(|name| !name.starts_with(WORKER))
+                && !path.join(OPTIMIZATION_BEST_FILE).is_file()
+        })
+    })
 }
 
 struct CorpusDirEntry {
@@ -1467,6 +1487,30 @@ mod tests {
         };
 
         (manager, seed_uuid)
+    }
+
+    #[test]
+    fn detects_legacy_invariant_corpus_dirs_without_matching_worker_dirs() {
+        let corpus_root = temp_corpus_dir();
+        fs::create_dir_all(corpus_root.join("worker0")).unwrap();
+        assert!(!has_legacy_invariant_corpus_dirs(&corpus_root));
+
+        fs::create_dir_all(corpus_root.join("invariant_a")).unwrap();
+        assert!(has_legacy_invariant_corpus_dirs(&corpus_root));
+    }
+
+    #[test]
+    fn ignores_optimization_invariant_corpus_dirs_when_detecting_legacy_dirs() {
+        let corpus_root = temp_corpus_dir();
+        fs::create_dir_all(corpus_root.join("worker0")).unwrap();
+        let optimization_dir = corpus_root.join("invariant_optimize");
+        fs::create_dir_all(optimization_dir.join("worker0")).unwrap();
+        fs::write(optimization_dir.join(OPTIMIZATION_BEST_FILE), "{}").unwrap();
+
+        assert!(!has_legacy_invariant_corpus_dirs(&corpus_root));
+
+        fs::create_dir_all(corpus_root.join("invariant_legacy").join("worker0")).unwrap();
+        assert!(has_legacy_invariant_corpus_dirs(&corpus_root));
     }
 
     #[test]
