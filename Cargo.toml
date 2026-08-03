@@ -409,7 +409,7 @@ alloy-evm = "0.37.0"
 alloy-op-evm = "0.32.0"
 
 # revm
-revm = { version = "41.0.0", default-features = false }
+revm = { version = "42.0.1", default-features = false }
 revm-inspectors = { version = "0.41.1", features = ["serde"] }
 op-revm = { version = "20.0.0", default-features = false }
 
@@ -440,7 +440,7 @@ bytes = "1.11"
 walkdir = "2"
 wait-timeout = "0.2"
 prettyplease = "0.3"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = [
     "clock",
     "std",
@@ -487,7 +487,7 @@ soldeer-core = { version = "=0.11.0", features = ["serde"] }
 strum = "0.28"
 tempfile = "3.23"
 tokio = "1"
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 toml = "1.1"
 toml_edit = "0.25"
 tower = "0.5"
